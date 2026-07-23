@@ -1,0 +1,7 @@
+streamlit>=1.35.0
+osmnx>=1.9.4
+leafmap>=0.30.0
+geopandas>=1.0.0
+shapely>=2.0.0
+requests>=2.30.0
+pandas>=1.5.0
