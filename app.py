@@ -396,7 +396,42 @@ def buildCampusMap(polygon_wkt, active_layers, status, focusName=None):
     if not foundAnything:
         raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
 
-    m.fit_bounds([[miny, minx], [maxy, maxx]])
+    # persistent labels: only for buildings/facilities with a REAL OSM name, not
+    # generic type fallbacks -- labeling every anonymous building on a large campus
+    # would just trade one kind of clutter for another. unnamed ones still show
+    # their type on hover, which already works.
+    namedLocations = {}
+    for gdf in (bldGdf, facGdf):
+        if gdf is None or gdf.empty or "HasName" not in gdf.columns:
+            continue
+        named = gdf[gdf["HasName"] == True]
+        for _, row in named.iterrows():
+            try:
+                centroid = row.geometry.centroid
+                label = row["Label"]
+                key = label
+                suffix = 2
+                while key in namedLocations:
+                    key = f"{label} ({suffix})"
+                    suffix += 1
+                namedLocations[key] = (centroid.y, centroid.x)
+                makeLabelMarker(centroid.y, centroid.x, label).add_to(m)
+            except Exception:
+                continue  # a single bad geometry shouldn't take down the whole map
+
+    if focusName and focusName in namedLocations:
+        flat, flon = namedLocations[focusName]
+        pad = 0.0015  # roughly a tight, single-building zoom window
+        m.fit_bounds([[flat - pad, flon - pad], [flat + pad, flon + pad]])
+        folium.CircleMarker(
+            location=[flat, flon],
+            radius=14,
+            color="#ffbf00",
+            weight=3,
+            fill=False,
+        ).add_to(m)
+    else:
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     rendered = [k for k in drawOrder if counts.get(k, 0) > 0]
     if rendered:
