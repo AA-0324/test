@@ -6,6 +6,7 @@ st.set_page_config(
 )
 
 import time
+import html
 import requests
 import pandas as pd
 import geopandas as gpd
@@ -172,14 +173,13 @@ def _friendly(value):
 def _labelFor(row, layer_key):
     name = row.get("name")
     if isinstance(name, str) and name.strip():
-        return name.strip()
+        return name.strip(), True
     tag_col, fallback_word = FALLBACK_TAG[layer_key]
-    # facilities can come from either amenity or leisure -- check both
     val = row.get(tag_col)
     if layer_key == "facilities" and not _friendly(val):
         val = row.get("leisure")
     friendly = _friendly(val)
-    return friendly if friendly else fallback_word
+    return (friendly if friendly else fallback_word), False
 
 
 def addLabelAndTrim(gdf, layer_key):
@@ -191,8 +191,10 @@ def addLabelAndTrim(gdf, layer_key):
         keep_cols.append("osmid")  # dedup's fallback path needs this if present
     try:
         gdf = gdf.copy()
-        gdf["Label"] = gdf.apply(lambda row: _labelFor(row, layer_key), axis=1)
-        keep_cols.append("Label")
+        labels = gdf.apply(lambda row: _labelFor(row, layer_key), axis=1)
+        gdf["Label"] = labels.apply(lambda t: t[0])
+        gdf["HasName"] = labels.apply(lambda t: t[1])
+        keep_cols += ["Label", "HasName"]
         return gdf[keep_cols]
     except Exception:
         return gdf  # labeling is cosmetic -- never let it break the actual data
@@ -311,7 +313,31 @@ def findCampus(name):
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
-def buildCampusMap(polygon_wkt, active_layers, status):
+def makeLabelMarker(lat, lon, text):
+    safe_text = html.escape(text)
+    label_html = f'''
+    <div style="
+        font-size: 10px;
+        font-family: sans-serif;
+        color: #222;
+        background: rgba(255,255,255,0.85);
+        padding: 1px 4px;
+        border-radius: 3px;
+        white-space: nowrap;
+        max-width: 110px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-align: center;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+    ">{safe_text}</div>
+    '''
+    return folium.Marker(
+        location=[lat, lon],
+        icon=folium.DivIcon(html=label_html, icon_size=(120, 20), icon_anchor=(60, 10)),
+    )
+
+
+def buildCampusMap(polygon_wkt, active_layers, status, focusName=None):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
@@ -340,6 +366,7 @@ def buildCampusMap(polygon_wkt, active_layers, status):
         facGdf = fetchOsmLayerRaw(polygon_wkt, "facilities")
         layerData["facilities"] = facGdf.__geo_interface__ if facGdf is not None else None
 
+    bldGdf = None
     if "buildings" in active_layers:
         status.update(label=f"Fetching {layer_labels['buildings']}...")
         bldGdf = fetchOsmLayerRaw(polygon_wkt, "buildings")
