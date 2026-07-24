@@ -9,6 +9,8 @@ import time
 import requests
 import pandas as pd
 import geopandas as gpd
+import folium
+from branca.element import MacroElement, Template
 from shapely.geometry import shape
 from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
@@ -46,19 +48,28 @@ layer_labels = {
     "facilities": "Specialized Facilities"
 }
 
-def styleFor(color, fill, opacity, weight):
+def styleFor(color, fill, opacity, weight, dashed=False):
     s = {"color": color, "fillColor": fill, "fillOpacity": opacity, "weight": weight, "opacity": 0.9}
+    if dashed:
+        s["dashArray"] = "6, 6"
     return lambda feat: s
 
 campusStyles = {
     "buildings": styleFor("#1f77b4", "#1f77b4", 0.45, 1.0),
-    "walkways": styleFor("#2ca02c", "#2ca02c", 0.0, 2.0),
+    "walkways": styleFor("#2ca02c", "#2ca02c", 0.0, 2.5, dashed=True),
     "roads": styleFor("#7f7f7f", "#7f7f7f", 0.0, 1.5),
     "facilities": styleFor("#d62728", "#d62728", 0.7, 1.5),
 }
 
+LAYER_COLORS = {
+    "buildings": "#1f77b4",
+    "walkways": "#2ca02c",
+    "roads": "#7f7f7f",
+    "facilities": "#d62728",
+}
+
 req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
-RATE_LIMIT_GAP = 1.1
+RATE_LIMIT_GAP = 1.5
 
 
 @st.cache_resource
@@ -114,13 +125,84 @@ def queryNominatim(q, limit=5):
         "format": "jsonv2",
         "limit": limit,
         "addressdetails": 1,
-        "extratags": 1,
         "polygon_geojson": 1,
     }
     throttleNominatim()
     r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
+
+    if r.status_code == 429:
+        # nominatim's public instance doesn't send a Retry-After header, so there's
+        # no reliable signal for how long an active block lasts -- it can be minutes
+        # or, per real-world reports, much longer. one short, single retry covers the
+        # case where this was a brief blip; anything beyond that risks looking like
+        # the exact abusive request pattern their rate limit exists to stop.
+        time.sleep(3)
+        r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
+
+    if r.status_code == 429:
+        raise ValueError(
+            "OpenStreetMap's free search service is rate-limiting requests right now "
+            "(HTTP 429). This is common on shared cloud hosting and isn't something "
+            "this app caused directly -- it can affect anyone sharing the same server, "
+            "not just repeat searches from this app. It usually clears on its own, but "
+            "can take anywhere from a few minutes to longer. Try again shortly."
+        )
+
     r.raise_for_status()
     return r.json()
+
+
+FALLBACK_TAG = {
+    "buildings": ("building", "Building"),
+    "facilities": ("amenity", "Facility"),
+    "walkways": ("highway", "Path"),
+    "roads": ("highway", "Road"),
+}
+
+
+def _friendly(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value.lower() == "yes":
+        return None
+    return value.replace("_", " ").replace("-", " ").title()
+
+
+def _labelFor(row, layer_key):
+    name = row.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    tag_col, fallback_word = FALLBACK_TAG[layer_key]
+    # facilities can come from either amenity or leisure -- check both
+    val = row.get(tag_col)
+    if layer_key == "facilities" and not _friendly(val):
+        val = row.get("leisure")
+    friendly = _friendly(val)
+    return friendly if friendly else fallback_word
+
+
+def addLabelAndTrim(gdf, layer_key):
+    if gdf is None or gdf.empty:
+        return gdf
+    geom_col = gdf.geometry.name
+    keep_cols = [geom_col]
+    if "osmid" in gdf.columns:
+        keep_cols.append("osmid")  # dedup's fallback path needs this if present
+    try:
+        gdf = gdf.copy()
+        gdf["Label"] = gdf.apply(lambda row: _labelFor(row, layer_key), axis=1)
+        keep_cols.append("Label")
+        return gdf[keep_cols]
+    except Exception:
+        return gdf  # labeling is cosmetic -- never let it break the actual data
+
+
+def makeTooltip():
+    # NOTE: each add_geojson call needs its OWN GeoJsonTooltip instance.
+    # reusing one shared instance across multiple layers is a documented
+    # folium bug (JS variable collision) that renders a blank map.
+    return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
 
 
 def fetchOsmLayer(polygon_wkt, layer_key):
@@ -131,6 +213,7 @@ def fetchOsmLayer(polygon_wkt, layer_key):
         if gdf is None or gdf.empty:
             return None
         gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+        gdf = addLabelAndTrim(gdf, layer_key)
         return gdf.__geo_interface__
     except Exception:
         return None
@@ -144,7 +227,8 @@ def fetchOsmLayerRaw(polygon_wkt, layer_key):
         gdf = ox.features_from_polygon(poly, tags=campus_tags[layer_key])
         if gdf is None or gdf.empty:
             return None
-        return gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+        gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+        return addLabelAndTrim(gdf, layer_key)
     except Exception:
         return None
 fetchOsmLayerRaw = st.cache_data(show_spinner=False, ttl="6h")(fetchOsmLayerRaw)
@@ -274,13 +358,35 @@ def buildCampusMap(polygon_wkt, active_layers, status):
             counts[k] = 0
             continue
         counts[k] = len(geo["features"])
-        m.add_geojson(geo, layer_name=layer_labels[k], style_function=campusStyles[k])
+        m.add_geojson(geo, layer_name=layer_labels[k], style_function=campusStyles[k], tooltip=makeTooltip())
         foundAnything = True
 
     if not foundAnything:
         raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
 
     m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+    rendered = [k for k in drawOrder if counts.get(k, 0) > 0]
+    if rendered:
+        rows = "".join(
+            f'<div style="margin:2px 0;">'
+            f'<span style="display:inline-block;width:12px;height:12px;background:{LAYER_COLORS[k]};'
+            f'margin-right:6px;border-radius:2px;"></span>{layer_labels[k]}</div>'
+            for k in rendered
+        )
+        legend_html = f"""
+        {{% macro html(this, kwargs) %}}
+        <div style="position: fixed; bottom: 30px; left: 10px; z-index: 9999;
+                    background: white; padding: 8px 12px; border-radius: 4px;
+                    box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px;
+                    font-family: sans-serif; line-height: 1.4;">
+            {rows}
+        </div>
+        {{% endmacro %}}
+        """
+        legend = MacroElement()
+        legend._template = Template(legend_html)
+        m.get_root().add_child(legend)
 
     return m, counts
 
