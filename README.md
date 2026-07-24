@@ -1,0 +1,1 @@
+# CampusWay test for Streamlit
