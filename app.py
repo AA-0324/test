@@ -36,16 +36,16 @@ def getIds(gdf):
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 campus_tags = {
-    "buildings": {"building": True},
-    "walkways": {"highway": ["footway", "path", "pedestrian", "steps"]},
-    "roads": {"highway": ["service", "residential", "unclassified", "living_street"]},
+    "buildings":  {"building": True},
+    "walkways":   {"highway": ["footway", "path", "pedestrian", "steps"]},
+    "roads":      {"highway": ["service", "residential", "unclassified", "living_street"]},
     "facilities": {"amenity": ["library", "food_court", "cafe"], "leisure": ["sports_centre", "fitness_centre"]}
 }
 
 layer_labels = {
-    "buildings": "Campus Buildings",
-    "walkways": "Pedestrian Paths",
-    "roads": "Roads & Service Routes",
+    "buildings":  "Campus Buildings",
+    "walkways":   "Pedestrian Paths",
+    "roads":      "Roads & Service Routes",
     "facilities": "Specialized Facilities"
 }
 
@@ -56,16 +56,16 @@ def styleFor(color, fill, opacity, weight, dashed=False):
     return lambda feat: s
 
 campusStyles = {
-    "buildings": styleFor("#1f77b4", "#1f77b4", 0.45, 1.0),
-    "walkways": styleFor("#2ca02c", "#2ca02c", 0.0, 2.5, dashed=True),
-    "roads": styleFor("#7f7f7f", "#7f7f7f", 0.0, 1.5),
-    "facilities": styleFor("#d62728", "#d62728", 0.7, 1.5),
+    "buildings":  styleFor("#1f77b4", "#1f77b4", 0.45, 1.0),
+    "walkways":   styleFor("#2ca02c", "#2ca02c", 0.0,  2.5, dashed=True),
+    "roads":      styleFor("#7f7f7f", "#7f7f7f", 0.0,  1.5),
+    "facilities": styleFor("#d62728", "#d62728", 0.7,  1.5),
 }
 
 LAYER_COLORS = {
-    "buildings": "#1f77b4",
-    "walkways": "#2ca02c",
-    "roads": "#7f7f7f",
+    "buildings":  "#1f77b4",
+    "walkways":   "#2ca02c",
+    "roads":      "#7f7f7f",
     "facilities": "#d62728",
 }
 
@@ -77,15 +77,10 @@ RATE_LIMIT_GAP = 1.5
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    # don't set overpass_settings manually -- it has {timeout} and {maxsize} placeholders
-    # that osmnx fills in itself. if you hardcode it those tokens never get substituted
-    # and your queries die after 30s with no useful error message. ask me how I know lol
     return True
 
 
 def throttleNominatim():
-    # session_state survives across reruns, a plain global doesn't -- learned this the
-    # annoying way when the rate limiter stopped working and nominatim started rejecting stuff
     t_last = st.session_state.get("nom_last", 0.0)
     gap = RATE_LIMIT_GAP - (time.monotonic() - t_last)
     if gap > 0:
@@ -132,21 +127,14 @@ def queryNominatim(q, limit=5):
     r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
 
     if r.status_code == 429:
-        # nominatim's public instance doesn't send a Retry-After header, so there's
-        # no reliable signal for how long an active block lasts -- it can be minutes
-        # or, per real-world reports, much longer. one short, single retry covers the
-        # case where this was a brief blip; anything beyond that risks looking like
-        # the exact abusive request pattern their rate limit exists to stop.
         time.sleep(3)
         r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
 
     if r.status_code == 429:
         raise ValueError(
             "OpenStreetMap's free search service is rate-limiting requests right now "
-            "(HTTP 429). This is common on shared cloud hosting and isn't something "
-            "this app caused directly -- it can affect anyone sharing the same server, "
-            "not just repeat searches from this app. It usually clears on its own, but "
-            "can take anywhere from a few minutes to longer. Try again shortly."
+            "(HTTP 429). This is common on shared cloud hosting and isn't caused by "
+            "this app directly. It usually clears on its own -- try again shortly."
         )
 
     r.raise_for_status()
@@ -154,10 +142,10 @@ def queryNominatim(q, limit=5):
 
 
 FALLBACK_TAG = {
-    "buildings": ("building", "Building"),
+    "buildings":  ("building", "Building"),
     "facilities": ("amenity", "Facility"),
-    "walkways": ("highway", "Path"),
-    "roads": ("highway", "Road"),
+    "walkways":   ("highway", "Path"),
+    "roads":      ("highway", "Road"),
 }
 
 
@@ -188,22 +176,21 @@ def addLabelAndTrim(gdf, layer_key):
     geom_col = gdf.geometry.name
     keep_cols = [geom_col]
     if "osmid" in gdf.columns:
-        keep_cols.append("osmid")  # dedup's fallback path needs this if present
+        keep_cols.append("osmid")
     try:
         gdf = gdf.copy()
         labels = gdf.apply(lambda row: _labelFor(row, layer_key), axis=1)
-        gdf["Label"] = labels.apply(lambda t: t[0])
+        gdf["Label"]   = labels.apply(lambda t: t[0])
         gdf["HasName"] = labels.apply(lambda t: t[1])
         keep_cols += ["Label", "HasName"]
         return gdf[keep_cols]
     except Exception:
-        return gdf  # labeling is cosmetic -- never let it break the actual data
+        return gdf
 
 
 def makeTooltip():
-    # NOTE: each add_geojson call needs its OWN GeoJsonTooltip instance.
-    # reusing one shared instance across multiple layers is a documented
-    # folium bug (JS variable collision) that renders a blank map.
+    # each layer needs its OWN instance -- reusing one object is a documented
+    # folium bug that causes a JS collision and blanks the map
     return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
 
 
@@ -237,32 +224,22 @@ fetchOsmLayerRaw = st.cache_data(show_spinner=False, ttl="6h")(fetchOsmLayerRaw)
 
 
 def stripDuplicateBuildings(buildingsDf, facilitiesDf):
-    # osm tags a lot of campus buildings as BOTH building=yes AND amenity=library
-    # (or cafe, gym, etc), which means without this step the same polygon ends up
-    # in both the buildings layer and the facilities layer, drawn on top of each other
-    #
-    # has to run BEFORE converting to geojson -- geopandas replaces the osm ids with
-    # sequential integers in the geojson output, so you can't match them up afterwards
     if buildingsDf is None or buildingsDf.empty:
         return buildingsDf
-
     fac_ids = getIds(facilitiesDf)
     if not fac_ids:
         return buildingsDf
-
     try:
         bld_ids = getIds(buildingsDf)
         overlap = bld_ids & fac_ids
         if not overlap:
             return buildingsDf
-
         if isinstance(buildingsDf.index, pd.MultiIndex):
             idList = [x[-1] if isinstance(x, tuple) else x for x in buildingsDf.index]
         elif "osmid" in buildingsDf.columns:
             idList = list(buildingsDf["osmid"])
         else:
             return buildingsDf
-
         keep = [i not in overlap for i in idList]
         return buildingsDf[keep]
     except Exception:
@@ -313,31 +290,7 @@ def findCampus(name):
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
-def makeLabelMarker(lat, lon, text):
-    safe_text = html.escape(text)
-    label_html = f'''
-    <div style="
-        font-size: 10px;
-        font-family: sans-serif;
-        color: #222;
-        background: rgba(255,255,255,0.85);
-        padding: 1px 4px;
-        border-radius: 3px;
-        white-space: nowrap;
-        max-width: 110px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        text-align: center;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.25);
-    ">{safe_text}</div>
-    '''
-    return folium.Marker(
-        location=[lat, lon],
-        icon=folium.DivIcon(html=label_html, icon_size=(120, 20), icon_anchor=(60, 10)),
-    )
-
-
-def buildCampusMap(polygon_wkt, active_layers, status, focusName=None):
+def buildCampusMap(polygon_wkt, active_layers, status):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
@@ -396,42 +349,28 @@ def buildCampusMap(polygon_wkt, active_layers, status, focusName=None):
     if not foundAnything:
         raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
 
-    # persistent labels: only for buildings/facilities with a REAL OSM name, not
-    # generic type fallbacks -- labeling every anonymous building on a large campus
-    # would just trade one kind of clutter for another. unnamed ones still show
-    # their type on hover, which already works.
+    # build the named-locations index for the search feature
+    # keyed by display name, value is (lat, lon) of the feature's centroid
+    # only includes features with a real OSM name, not generic type fallbacks
     namedLocations = {}
     for gdf in (bldGdf, facGdf):
         if gdf is None or gdf.empty or "HasName" not in gdf.columns:
             continue
-        named = gdf[gdf["HasName"] == True]
-        for _, row in named.iterrows():
+        for _, row in gdf[gdf["HasName"] == True].iterrows():
             try:
                 centroid = row.geometry.centroid
                 label = row["Label"]
+                # handle duplicate OSM names (e.g. two buildings both named "Cafeteria")
                 key = label
-                suffix = 2
+                n = 2
                 while key in namedLocations:
-                    key = f"{label} ({suffix})"
-                    suffix += 1
+                    key = f"{label} ({n})"
+                    n += 1
                 namedLocations[key] = (centroid.y, centroid.x)
-                makeLabelMarker(centroid.y, centroid.x, label).add_to(m)
             except Exception:
-                continue  # a single bad geometry shouldn't take down the whole map
+                continue
 
-    if focusName and focusName in namedLocations:
-        flat, flon = namedLocations[focusName]
-        pad = 0.0015  # roughly a tight, single-building zoom window
-        m.fit_bounds([[flat - pad, flon - pad], [flat + pad, flon + pad]])
-        folium.CircleMarker(
-            location=[flat, flon],
-            radius=14,
-            color="#ffbf00",
-            weight=3,
-            fill=False,
-        ).add_to(m)
-    else:
-        m.fit_bounds([[miny, minx], [maxy, maxx]])
+    m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     rendered = [k for k in drawOrder if counts.get(k, 0) > 0]
     if rendered:
@@ -455,8 +394,10 @@ def buildCampusMap(polygon_wkt, active_layers, status, focusName=None):
         legend._template = Template(legend_html)
         m.get_root().add_child(legend)
 
-    return m, counts
+    return m, counts, namedLocations
 
+
+# ── sidebar ──────────────────────────────────────────────────────────────────
 
 use_facilities = True
 
@@ -464,27 +405,49 @@ with st.sidebar:
     campusInput = st.text_input(
         "University or college name",
         placeholder='e.g. "MIT" or "Foothill College, CA"',
-        help="Full names, partial names, and acronyms all work. Add a city or country if you get the wrong result. Press Enter or click Generate Map below."
+        help="Full names, partial names, and acronyms all work. Add a city or country if you get the wrong result."
     )
 
-    showBuildings = st.checkbox("Campus Buildings", value=True)
-    showPaths = st.checkbox("Pedestrian Paths", value=True)
-    showRoads = st.checkbox("Roads & Service Routes", value=True)
+    showBuildings  = st.checkbox("Campus Buildings",       value=True)
+    showPaths      = st.checkbox("Pedestrian Paths",       value=True)
+    showRoads      = st.checkbox("Roads & Service Routes", value=True)
     showFacilities = st.checkbox("Specialized Facilities", value=use_facilities)
 
     searchBtn = st.button("Generate Map", type="primary", use_container_width=True)
 
     active_layers = []
-    if showPaths:
-        active_layers.append("walkways")
-    if showBuildings:
-        active_layers.append("buildings")
-    if showFacilities:
-        active_layers.append("facilities")
-    if showRoads:
-        active_layers.append("roads")
+    if showPaths:      active_layers.append("walkways")
+    if showBuildings:  active_layers.append("buildings")
+    if showFacilities: active_layers.append("facilities")
+    if showRoads:      active_layers.append("roads")
+
+    # "Find a building" dropdown -- only shown after a map has been generated
+    # and named buildings/facilities are available
+    namedLocs = st.session_state.get("namedLocations", {})
+    focusName = None
+    if namedLocs:
+        st.divider()
+        options = ["-- Select a building --"] + sorted(namedLocs.keys())
+        selected = st.selectbox("Find a building", options)
+        if selected != "-- Select a building --":
+            focusName = selected
+
+
+# ── main area ─────────────────────────────────────────────────────────────────
 
 if not searchBtn or not campusInput.strip():
+    st.markdown(
+        """
+        <div style="height: 580px; display: flex; align-items: center;
+                    justify-content: center; color: #888; font-size: 16px;
+                    font-family: sans-serif; border: 1px dashed #ddd;
+                    border-radius: 6px; text-align: center; padding: 32px;">
+            Enter a university or college name in the sidebar<br>
+            and click <strong>Generate Map</strong> to get started.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.stop()
 
 searchTerm = campusInput.strip()
@@ -507,7 +470,8 @@ with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)',
 
     if err is None:
         try:
-            campusMap, layerCounts = buildCampusMap(campusPoly, active_layers, status)
+            campusMap, layerCounts, namedLocations = buildCampusMap(campusPoly, active_layers, status)
+            st.session_state["namedLocations"] = namedLocations
             status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
         except ValueError as e:
             status.update(label="No OSM data found", state="error")
@@ -523,5 +487,22 @@ if err is not None:
     else:
         st.warning(msg)
     st.stop()
+
+# if the user picked a building from the dropdown, rebuild the map zoomed and
+# highlighted to that building. uses cached layer data so no re-fetch happens.
+if focusName and focusName in st.session_state.get("namedLocations", {}):
+    flat, flon = st.session_state["namedLocations"][focusName]
+    pad = 0.0012
+    campusMap.fit_bounds([[flat - pad, flon - pad], [flat + pad, flon + pad]])
+    folium.CircleMarker(
+        location=[flat, flon],
+        radius=16,
+        color="#ff6600",
+        weight=3,
+        fill=True,
+        fill_color="#ff6600",
+        fill_opacity=0.15,
+        tooltip=folium.Tooltip(focusName),
+    ).add_to(campusMap)
 
 campusMap.to_streamlit(height=620)
