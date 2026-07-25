@@ -435,22 +435,14 @@ with st.sidebar:
 
 # ── main area ─────────────────────────────────────────────────────────────────
 
-if not searchBtn or not campusInput.strip():
-    st.markdown(
-        """
-        <div style="height: 580px; display: flex; align-items: center;
-                    justify-content: center; color: #888; font-size: 16px;
-                    font-family: sans-serif; border: 1px dashed #ddd;
-                    border-radius: 6px; text-align: center; padding: 32px;">
-            Enter a university or college name in the sidebar<br>
-            and click <strong>Generate Map</strong> to get started.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
+if searchBtn and campusInput.strip():
+    st.session_state["lastSearch"] = campusInput.strip()
 
-searchTerm = campusInput.strip()
+searchTerm = st.session_state.get("lastSearch", "")
+
+if not searchTerm:
+    st.info("Enter a university or college name in the sidebar and click **Generate Map** to get started.")
+    st.stop()
 err = None
 
 with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
