@@ -7,6 +7,7 @@ st.set_page_config(
 
 import time
 import html
+import re
 import requests
 import pandas as pd
 import geopandas as gpd
@@ -147,11 +148,14 @@ FALLBACK_TAG = {
 }
 
 
+USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
+
+
 def _friendly(value):
     if not isinstance(value, str):
         return None
     value = value.strip()
-    if not value or value.lower() == "yes":
+    if not value or value.lower() in USELESS_CATEGORY_VALUES:
         return None
     return value.replace("_", " ").replace("-", " ").title()
 
@@ -321,6 +325,17 @@ def stripDuplicateBuildings(buildingsDf, facilitiesDf):
         return buildingsDf
 
 
+def _alternateNameGuess(name):
+    # common naming confusion: "University of X" vs the institution's real name
+    # "X University" (and same for College) -- try the swap as a genuine second
+    # attempt rather than assuming either order is always correct
+    m = re.match(r'^(university|college)\s+of\s+(.+)$', name.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    kind, rest = m.groups()
+    return f"{rest.strip()} {kind.title()}"
+
+
 def findCampus(name):
     results = queryNominatim(name)
     if not results:
@@ -328,6 +343,26 @@ def findCampus(name):
 
     results.sort(key=lambda r: not looksLikeCampus(r))
     edu_hits = [r for r in results if looksLikeCampus(r)]
+
+    if not edu_hits:
+        alt = _alternateNameGuess(name)
+        if alt:
+            try:
+                altResults = queryNominatim(alt)
+                altResults.sort(key=lambda r: not looksLikeCampus(r))
+                altEduHits = [r for r in altResults if looksLikeCampus(r)]
+                if altEduHits:
+                    edu_hits = altEduHits
+                    results = altResults
+            except Exception:
+                pass  # if the alternate attempt fails for any reason, fall through to the honest error below
+
+    if not edu_hits:
+        raise ValueError(
+            f'None of the search results for **"{name}"** look like a university or college.\n\n'
+            f'Try the institution\'s full official name (for example, "Carleton University" '
+            f'rather than "University of Carleton"), or add a city/country for a more specific match.'
+        )
 
     for hit in edu_hits:
         geo = hit.get("geojson") or {}
@@ -343,7 +378,7 @@ def findCampus(name):
         except Exception:
             continue
 
-    top_hit = edu_hits[0] if edu_hits else results[0]
+    top_hit = edu_hits[0]
     hitName = top_hit.get("display_name", name)
 
     try:
@@ -437,7 +472,8 @@ def buildCampusMap(polygon_wkt, active_layers, status):
                 centroid = row.geometry.centroid
                 label = row["Label"]
                 category = row.get("Category")
-                display = f"{label} ({category})" if category else label
+                hasCategory = isinstance(category, str) and pd.notna(category) and category.strip()
+                display = f"{label} ({category})" if hasCategory else label
                 key = display
                 n = 2
                 while key in namedLocations:
