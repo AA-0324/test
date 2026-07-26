@@ -35,12 +35,10 @@ def getIds(gdf):
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
-campus_tags = {
-    "buildings":  {"building": True},
-    "walkways":   {"highway": ["footway", "path", "pedestrian", "steps"]},
-    "roads":      {"highway": ["service", "residential", "unclassified", "living_street"]},
-    "facilities": {"amenity": ["library", "food_court", "cafe"], "leisure": ["sports_centre", "fitness_centre"]}
-}
+WALKWAY_VALUES = ["footway", "path", "pedestrian", "steps"]
+ROAD_VALUES = ["service", "residential", "unclassified", "living_street"]
+FACILITY_AMENITY_VALUES = ["library", "food_court", "cafe"]
+FACILITY_LEISURE_VALUES = ["sports_centre", "fitness_centre"]
 
 layer_labels = {
     "buildings":  "Campus Buildings",
@@ -194,33 +192,85 @@ def makeTooltip():
     return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
 
 
-def fetchOsmLayer(polygon_wkt, layer_key):
+def _mergeBounds(existing, south, west, north, east):
+    if existing is None:
+        return (south, west, north, east)
+    es, ew, en, ee = existing
+    return (min(es, south), min(ew, west), max(en, north), max(ee, east))
+
+
+def fetchRoadsAndWalkways(polygon_wkt):
+    # ONE combined Overpass query for both roads and walkways (both are highway=*
+    # tags, just different values) instead of two separate round-trips -- OSMnx
+    # documents this union behavior explicitly and it's covered by their own test
+    # suite, so this is a supported pattern, not a workaround.
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
     try:
-        gdf = ox.features_from_polygon(poly, tags=campus_tags[layer_key])
-        if gdf is None or gdf.empty:
-            return None
+        gdf = ox.features_from_polygon(poly, tags={"highway": WALKWAY_VALUES + ROAD_VALUES})
+        if gdf is None or gdf.empty or "highway" not in gdf.columns:
+            return None, None, {}
         gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-        gdf = addLabelAndTrim(gdf, layer_key)
-        return gdf.__geo_interface__
+
+        walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
+        roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
+
+        # named-road index: group by name and combine bounds across every segment
+        # sharing that name -- a single named road is often split into many
+        # disconnected OSM ways, so this must be a union of all of them, not just
+        # the first one found (unlike buildings, which are single polygons)
+        namedRoads = {}
+        for segment_gdf in (roads, walkways):
+            if segment_gdf.empty or "name" not in segment_gdf.columns:
+                continue
+            named_segments = segment_gdf[segment_gdf["name"].notna()]
+            for name, group in named_segments.groupby("name"):
+                name = str(name).strip()
+                if not name:
+                    continue
+                minx, miny, maxx, maxy = group.total_bounds
+                namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
+
+        walkways = addLabelAndTrim(walkways, "walkways")
+        roads = addLabelAndTrim(roads, "roads")
+        walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
+        roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
+        return roadGeo, walkGeo, namedRoads
     except Exception:
-        return None
-fetchOsmLayer = st.cache_data(show_spinner=False, ttl="6h")(fetchOsmLayer)
+        return None, None, {}
+fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="6h")(fetchRoadsAndWalkways)
 
 
-def fetchOsmLayerRaw(polygon_wkt, layer_key):
+def fetchBuildingsAndFacilities(polygon_wkt):
+    # ONE combined query for buildings + facilities instead of two round-trips.
+    # a feature CAN legitimately have both building=yes and amenity=library --
+    # that's fine, it lands in both splits below, and the existing dedup step
+    # (stripDuplicateBuildings) already handles exactly that overlap correctly.
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
     try:
-        gdf = ox.features_from_polygon(poly, tags=campus_tags[layer_key])
+        gdf = ox.features_from_polygon(poly, tags={
+            "building": True,
+            "amenity": FACILITY_AMENITY_VALUES,
+            "leisure": FACILITY_LEISURE_VALUES,
+        })
         if gdf is None or gdf.empty:
-            return None
+            return None, None
         gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-        return addLabelAndTrim(gdf, layer_key)
+
+        has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
+        has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
+        has_leisure = gdf["leisure"].isin(FACILITY_LEISURE_VALUES) if "leisure" in gdf.columns else pd.Series(False, index=gdf.index)
+
+        buildings = gdf[has_building].copy()
+        facilities = gdf[has_amenity | has_leisure].copy()
+
+        buildings = addLabelAndTrim(buildings, "buildings")
+        facilities = addLabelAndTrim(facilities, "facilities")
+        return buildings, facilities
     except Exception:
-        return None
-fetchOsmLayerRaw = st.cache_data(show_spinner=False, ttl="6h")(fetchOsmLayerRaw)
+        return None, None
+fetchBuildingsAndFacilities = st.cache_data(show_spinner=False, ttl="6h")(fetchBuildingsAndFacilities)
 
 
 def stripDuplicateBuildings(buildingsDf, facilitiesDf):
@@ -307,24 +357,25 @@ def buildCampusMap(polygon_wkt, active_layers, status):
     ).add_to(m)
 
     layerData = {}
+    namedRoads = {}
 
-    for k in ("roads", "walkways"):
-        if k in active_layers:
-            status.update(label=f"Fetching {layer_labels[k]}...")
-            layerData[k] = fetchOsmLayer(polygon_wkt, k)
+    if "roads" in active_layers or "walkways" in active_layers:
+        status.update(label="Fetching roads and pedestrian paths...")
+        roadGeo, walkGeo, namedRoads = fetchRoadsAndWalkways(polygon_wkt)
+        if "roads" in active_layers:
+            layerData["roads"] = roadGeo
+        if "walkways" in active_layers:
+            layerData["walkways"] = walkGeo
 
-    facGdf = None
-    if "facilities" in active_layers:
-        status.update(label=f"Fetching {layer_labels['facilities']}...")
-        facGdf = fetchOsmLayerRaw(polygon_wkt, "facilities")
-        layerData["facilities"] = facGdf.__geo_interface__ if facGdf is not None else None
-
-    bldGdf = None
-    if "buildings" in active_layers:
-        status.update(label=f"Fetching {layer_labels['buildings']}...")
-        bldGdf = fetchOsmLayerRaw(polygon_wkt, "buildings")
-        bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
-        layerData["buildings"] = bldGdf.__geo_interface__ if bldGdf is not None else None
+    bldGdf = facGdf = None
+    if "buildings" in active_layers or "facilities" in active_layers:
+        status.update(label="Fetching buildings and facilities...")
+        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+        if "buildings" in active_layers:
+            bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
+            layerData["buildings"] = bldGdf.__geo_interface__ if bldGdf is not None and not bldGdf.empty else None
+        if "facilities" in active_layers:
+            layerData["facilities"] = facGdf.__geo_interface__ if facGdf is not None and not facGdf.empty else None
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     counts = {}
@@ -349,9 +400,7 @@ def buildCampusMap(polygon_wkt, active_layers, status):
     if not foundAnything:
         raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
 
-    # build the named-locations index for the search feature
-    # keyed by display name, value is (lat, lon) of the feature's centroid
-    # only includes features with a real OSM name, not generic type fallbacks
+    # named-building index for the "Find a building" search -- real OSM names only
     namedLocations = {}
     for gdf in (bldGdf, facGdf):
         if gdf is None or gdf.empty or "HasName" not in gdf.columns:
@@ -360,7 +409,6 @@ def buildCampusMap(polygon_wkt, active_layers, status):
             try:
                 centroid = row.geometry.centroid
                 label = row["Label"]
-                # handle duplicate OSM names (e.g. two buildings both named "Cafeteria")
                 key = label
                 n = 2
                 while key in namedLocations:
@@ -394,7 +442,7 @@ def buildCampusMap(polygon_wkt, active_layers, status):
         legend._template = Template(legend_html)
         m.get_root().add_child(legend)
 
-    return m, counts, namedLocations
+    return m, counts, namedLocations, namedRoads
 
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
@@ -402,18 +450,23 @@ def buildCampusMap(polygon_wkt, active_layers, status):
 use_facilities = True
 
 with st.sidebar:
+    st.subheader("Search")
     campusInput = st.text_input(
         "University or college name",
         placeholder='e.g. "MIT" or "Foothill College, CA"',
         help="Full names, partial names, and acronyms all work. Add a city or country if you get the wrong result."
     )
-
-    showBuildings  = st.checkbox("Campus Buildings",       value=True)
-    showPaths      = st.checkbox("Pedestrian Paths",       value=True)
-    showRoads      = st.checkbox("Roads & Service Routes", value=True)
-    showFacilities = st.checkbox("Specialized Facilities", value=use_facilities)
-
     searchBtn = st.button("Generate Map", type="primary", use_container_width=True)
+
+    st.divider()
+    st.subheader("Layers")
+    col1, col2 = st.columns(2)
+    with col1:
+        showBuildings = st.checkbox("Buildings", value=True)
+        showRoads     = st.checkbox("Roads",     value=True)
+    with col2:
+        showPaths      = st.checkbox("Paths",      value=True)
+        showFacilities = st.checkbox("Facilities", value=use_facilities)
 
     active_layers = []
     if showPaths:      active_layers.append("walkways")
@@ -421,67 +474,99 @@ with st.sidebar:
     if showFacilities: active_layers.append("facilities")
     if showRoads:      active_layers.append("roads")
 
-    # "Find a building" dropdown -- only shown after a map has been generated
-    # and named buildings/facilities are available
     namedLocs = st.session_state.get("namedLocations", {})
+    namedRds = st.session_state.get("namedRoads", {})
     focusName = None
-    if namedLocs:
+    focusRoad = None
+
+    if namedLocs or namedRds:
         st.divider()
-        options = ["-- Select a building --"] + sorted(namedLocs.keys())
-        selected = st.selectbox("Find a building", options)
-        if selected != "-- Select a building --":
-            focusName = selected
+        st.subheader("Navigate")
+
+        if namedLocs:
+            options = ["-- Select a building --"] + sorted(namedLocs.keys())
+            selected = st.selectbox(
+                "Find a building",
+                options,
+                help="Start typing to filter the list.",
+            )
+            if selected != "-- Select a building --":
+                focusName = selected
+
+        if namedRds:
+            roadOptions = ["-- Select a road --"] + sorted(namedRds.keys())
+            selectedRoad = st.selectbox(
+                "Find a road",
+                roadOptions,
+                help="Start typing to filter the list.",
+            )
+            if selectedRoad != "-- Select a road --":
+                focusRoad = selectedRoad
 
 
 # ── main area ─────────────────────────────────────────────────────────────────
 
 if searchBtn and campusInput.strip():
-    st.session_state["lastSearch"] = campusInput.strip()
+    newSearch = campusInput.strip()
+    if newSearch != st.session_state.get("lastSearch", ""):
+        st.session_state["lastSearch"] = newSearch
+        st.session_state.pop("campusMap", None)
+        st.session_state.pop("namedLocations", None)
+        st.session_state.pop("namedRoads", None)
 
 searchTerm = st.session_state.get("lastSearch", "")
 
 if not searchTerm:
     st.info("Enter a university or college name in the sidebar and click **Generate Map** to get started.")
     st.stop()
-err = None
 
-with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
-    try:
-        campusName, campusPoly = findCampus(searchTerm)
-        status.update(label=f"Found: {campusName}", state="running")
-    except ValueError as e:
-        status.update(label="Could not find campus", state="error")
-        err = ("error", str(e))
-    except Exception as e:
-        status.update(label="Unexpected error", state="error")
-        err = ("error", f"Something went wrong: `{e}`")
-
-    if err is None and not active_layers:
-        status.update(label="No layers selected", state="error")
-        err = ("warning", "Select at least one layer in the sidebar.")
-
-    if err is None:
+if "campusMap" not in st.session_state:
+    err = None
+    with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            campusMap, layerCounts, namedLocations = buildCampusMap(campusPoly, active_layers, status)
-            st.session_state["namedLocations"] = namedLocations
-            status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
+            campusName, campusPoly = findCampus(searchTerm)
+            status.update(label=f"Found: {campusName}", state="running")
         except ValueError as e:
-            status.update(label="No OSM data found", state="error")
-            err = ("warning", str(e))
+            status.update(label="Could not find campus", state="error")
+            err = ("error", str(e))
         except Exception as e:
-            status.update(label="Map build failed", state="error")
-            err = ("error", f"Could not build map: `{e}`")
+            status.update(label="Unexpected error", state="error")
+            err = ("error", f"Something went wrong: `{e}`")
 
-if err is not None:
-    kind, msg = err
-    if kind == "error":
-        st.error(msg)
-    else:
-        st.warning(msg)
-    st.stop()
+        if err is None and not active_layers:
+            status.update(label="No layers selected", state="error")
+            err = ("warning", "Select at least one layer in the sidebar.")
 
-# if the user picked a building from the dropdown, rebuild the map zoomed and
-# highlighted to that building. uses cached layer data so no re-fetch happens.
+        if err is None:
+            try:
+                campusMap, layerCounts, namedLocations, namedRoads = buildCampusMap(campusPoly, active_layers, status)
+                st.session_state["campusMap"] = campusMap
+                st.session_state["namedLocations"] = namedLocations
+                st.session_state["namedRoads"] = namedRoads
+                status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
+            except ValueError as e:
+                status.update(label="No OSM data found", state="error")
+                err = ("warning", str(e))
+            except Exception as e:
+                status.update(label="Map build failed", state="error")
+                err = ("error", f"Could not build map: `{e}`")
+
+    if err is not None:
+        kind, msg = err
+        if kind == "error":
+            st.error(msg)
+        else:
+            st.warning(msg)
+        st.stop()
+
+    # force an immediate follow-up rerun so the sidebar picks up the freshly
+    # populated namedLocations/namedRoads on its next execution -- otherwise the
+    # "Find a building"/"Find a road" dropdowns wouldn't appear until some
+    # unrelated later interaction happened to trigger another rerun
+    st.rerun()
+
+campusMap = st.session_state["campusMap"]
+
 if focusName and focusName in st.session_state.get("namedLocations", {}):
     flat, flon = st.session_state["namedLocations"][focusName]
     pad = 0.0012
@@ -496,5 +581,10 @@ if focusName and focusName in st.session_state.get("namedLocations", {}):
         fill_opacity=0.15,
         tooltip=folium.Tooltip(focusName),
     ).add_to(campusMap)
+elif focusRoad and focusRoad in st.session_state.get("namedRoads", {}):
+    s, w, n, e = st.session_state["namedRoads"][focusRoad]
+    padLat = max((n - s) * 0.15, 0.0005)
+    padLon = max((e - w) * 0.15, 0.0005)
+    campusMap.fit_bounds([[s - padLat, w - padLon], [n + padLat, e + padLon]])
 
 campusMap.to_streamlit(height=620)
