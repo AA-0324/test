@@ -168,6 +168,14 @@ def _labelFor(row, layer_key):
     return (friendly if friendly else fallback_word), False
 
 
+def _categoryFor(row, layer_key):
+    tag_col, _ = FALLBACK_TAG[layer_key]
+    val = row.get(tag_col)
+    if layer_key == "facilities" and not _friendly(val):
+        val = row.get("leisure")
+    return _friendly(val)
+
+
 def addLabelAndTrim(gdf, layer_key):
     if gdf is None or gdf.empty:
         return gdf
@@ -178,10 +186,25 @@ def addLabelAndTrim(gdf, layer_key):
     try:
         gdf = gdf.copy()
         labels = gdf.apply(lambda row: _labelFor(row, layer_key), axis=1)
-        gdf["Label"]   = labels.apply(lambda t: t[0])
-        gdf["HasName"] = labels.apply(lambda t: t[1])
-        keep_cols += ["Label", "HasName"]
+        gdf["Label"]    = labels.apply(lambda t: t[0])
+        gdf["HasName"]  = labels.apply(lambda t: t[1])
+        gdf["Category"] = gdf.apply(lambda row: _categoryFor(row, layer_key), axis=1)
+        keep_cols += ["Label", "HasName", "Category"]
         return gdf[keep_cols]
+    except Exception:
+        return gdf
+
+
+SIMPLIFY_TOLERANCE = 0.000015  # ~1.5m at typical campus latitudes -- conservative enough to not visibly distort shapes
+
+
+def _simplify(gdf):
+    if gdf is None or gdf.empty:
+        return gdf
+    try:
+        gdf = gdf.copy()
+        gdf["geometry"] = gdf.geometry.simplify(SIMPLIFY_TOLERANCE, preserve_topology=True)
+        return gdf
     except Exception:
         return gdf
 
@@ -211,6 +234,7 @@ def fetchRoadsAndWalkways(polygon_wkt):
         if gdf is None or gdf.empty or "highway" not in gdf.columns:
             return None, None, {}
         gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+        gdf = _simplify(gdf)
 
         walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
         roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
@@ -257,6 +281,7 @@ def fetchBuildingsAndFacilities(polygon_wkt):
         if gdf is None or gdf.empty:
             return None, None
         gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+        gdf = _simplify(gdf)
 
         has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
         has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
@@ -400,7 +425,9 @@ def buildCampusMap(polygon_wkt, active_layers, status):
     if not foundAnything:
         raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
 
-    # named-building index for the "Find a building" search -- real OSM names only
+    # named-building index for the "Find a building" search -- real OSM names only,
+    # decorated with category so searching "library" or "cafe" surfaces matches
+    # even when the freshman doesn't know the specific building's name
     namedLocations = {}
     for gdf in (bldGdf, facGdf):
         if gdf is None or gdf.empty or "HasName" not in gdf.columns:
@@ -409,10 +436,12 @@ def buildCampusMap(polygon_wkt, active_layers, status):
             try:
                 centroid = row.geometry.centroid
                 label = row["Label"]
-                key = label
+                category = row.get("Category")
+                display = f"{label} ({category})" if category else label
+                key = display
                 n = 2
                 while key in namedLocations:
-                    key = f"{label} ({n})"
+                    key = f"{display} #{n}"
                     n += 1
                 namedLocations[key] = (centroid.y, centroid.x)
             except Exception:
@@ -482,25 +511,26 @@ with st.sidebar:
     if namedLocs or namedRds:
         st.divider()
         st.subheader("Navigate")
+        st.caption("Type a building or road name to jump straight to it.")
 
         if namedLocs:
-            options = ["-- Select a building --"] + sorted(namedLocs.keys())
             selected = st.selectbox(
                 "Find a building",
-                options,
-                help="Start typing to filter the list.",
+                sorted(namedLocs.keys()),
+                index=None,
+                placeholder="Type to search buildings...",
             )
-            if selected != "-- Select a building --":
+            if selected:
                 focusName = selected
 
         if namedRds:
-            roadOptions = ["-- Select a road --"] + sorted(namedRds.keys())
             selectedRoad = st.selectbox(
                 "Find a road",
-                roadOptions,
-                help="Start typing to filter the list.",
+                sorted(namedRds.keys()),
+                index=None,
+                placeholder="Type to search roads...",
             )
-            if selectedRoad != "-- Select a road --":
+            if selectedRoad:
                 focusRoad = selectedRoad
 
 
