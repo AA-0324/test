@@ -226,6 +226,34 @@ def _mergeBounds(existing, south, west, north, east):
     return (min(es, south), min(ew, west), max(en, north), max(ee, east))
 
 
+def _haversineMeters(lat1, lon1, lat2, lon2):
+    import math
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def nearbyLocations(focusLoc, focusName, allLocs, maxResults=4, maxMeters=300):
+    # cheap, purely local computation over data already fetched -- no extra
+    # network calls -- so this is essentially free to show whenever a
+    # student picks a building
+    if not focusLoc:
+        return []
+    flat, flon = focusLoc
+    out = []
+    for name, (lat, lon) in allLocs.items():
+        if name == focusName:
+            continue
+        d = _haversineMeters(flat, flon, lat, lon)
+        if d <= maxMeters:
+            out.append((name, d))
+    out.sort(key=lambda x: x[1])
+    return out[:maxResults]
+
+
 def _geomBounds(geometry):
     # walk a GeoJSON geometry's (possibly nested) coordinates to get min/max
     # lon/lat -- works for LineString, MultiLineString, or anything else
@@ -251,6 +279,30 @@ def _geomBounds(geometry):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def _roundGeoJson(geo, precision=6):
+    # OSM/shapely coordinates default to ~15-17 significant digits when
+    # serialized -- that's sub-millimeter precision nobody navigating on foot
+    # needs. Rounding to 6 decimal places (~11cm at campus latitudes) cuts the
+    # GeoJSON payload roughly in half with zero visible difference, which
+    # directly cuts caching time, network transfer to the browser, and the
+    # browser's own JSON-parse + render time.
+    if not geo:
+        return geo
+
+    def _round(c):
+        if isinstance(c, (list, tuple)) and c and isinstance(c[0], (int, float)):
+            return [round(v, precision) for v in c]
+        if isinstance(c, (list, tuple)):
+            return [_round(x) for x in c]
+        return c
+
+    for feat in geo.get("features", []):
+        geom = feat.get("geometry")
+        if geom and geom.get("coordinates") is not None:
+            geom["coordinates"] = _round(geom["coordinates"])
+    return geo
+
+
 def fetchRoadsAndWalkways(polygon_wkt):
     # ONE combined Overpass query for both roads and walkways (both are highway=*
     # tags, just different values) instead of two separate round-trips -- OSMnx
@@ -272,6 +324,8 @@ def fetchRoadsAndWalkways(polygon_wkt):
         roads = addLabelAndTrim(roads, "roads")
         walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
         roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
+        walkGeo = _roundGeoJson(walkGeo)
+        roadGeo = _roundGeoJson(roadGeo)
 
         # named-road index built directly from the SAME GeoJSON that gets
         # rendered/tooltipped on the map (not a separate pre-trim pass over the
@@ -307,7 +361,7 @@ def fetchRoadsAndWalkways(polygon_wkt):
         return roadGeo, walkGeo, namedRoads, namedRoadGeo
     except Exception:
         return None, None, {}, {}
-fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="6h")(fetchRoadsAndWalkways)
+fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="24h")(fetchRoadsAndWalkways)
 
 
 def fetchBuildingsAndFacilities(polygon_wkt):
@@ -340,7 +394,7 @@ def fetchBuildingsAndFacilities(polygon_wkt):
         return buildings, facilities
     except Exception:
         return None, None
-fetchBuildingsAndFacilities = st.cache_data(show_spinner=False, ttl="6h")(fetchBuildingsAndFacilities)
+fetchBuildingsAndFacilities = st.cache_data(show_spinner=False, ttl="24h")(fetchBuildingsAndFacilities)
 
 
 def stripDuplicateBuildings(buildingsDf, facilitiesDf):
@@ -470,9 +524,9 @@ def prepareCampusData(polygon_wkt, active_layers, status):
         bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
         if "buildings" in active_layers:
             bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
-            layerData["buildings"] = bldGdf.__geo_interface__ if bldGdf is not None and not bldGdf.empty else None
+            layerData["buildings"] = _roundGeoJson(bldGdf.__geo_interface__) if bldGdf is not None and not bldGdf.empty else None
         if "facilities" in active_layers:
-            layerData["facilities"] = facGdf.__geo_interface__ if facGdf is not None and not facGdf.empty else None
+            layerData["facilities"] = _roundGeoJson(facGdf.__geo_interface__) if facGdf is not None and not facGdf.empty else None
         status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
                      f"Facilities: {len(facGdf) if facGdf is not None else 0}")
 
@@ -551,13 +605,39 @@ def renderCampusMap(layerData, counts, bounds, focusName=None, focusLoc=None,
     cLat = (miny + maxy) / 2
     cLon = (minx + maxx) / 2
 
-    m = leafmap.Map(center=[cLat, cLon], zoom=15, tiles="CartoDB.Positron")
+    m = leafmap.Map(
+        center=[cLat, cLon],
+        zoom=15,
+        tiles="CartoDB.Positron",
+        prefer_canvas=True,   # canvas renderer instead of SVG -- much faster
+                               # with hundreds/thousands of building & road
+                               # shapes, which is exactly this app's workload
+        control_scale=True,   # small distance scale bar -- helps students
+                               # gauge how far a walk actually is
+    )
 
     folium_plugins.Fullscreen(
         position="topright",
         title="Expand map",
         title_cancel="Exit fullscreen",
         force_separate_button=True
+    ).add_to(m)
+
+    # "show my location" -- uses the browser's own GPS/Wi-Fi location, no
+    # server round-trip, so it's essentially free and is the single most
+    # useful feature for a freshman who is actually lost on campus right now
+    folium_plugins.LocateControl(
+        position="topright",
+        strings={"title": "Show my location"},
+        flyTo=True,
+    ).add_to(m)
+
+    # lets a student drag out a line/area on the map to see the real
+    # walking distance, e.g. "is it faster to cut through the quad?"
+    folium_plugins.MeasureControl(
+        position="topleft",
+        primary_length_unit="meters",
+        secondary_length_unit="feet",
     ).add_to(m)
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
@@ -644,6 +724,14 @@ with st.sidebar:
         help="Full names, partial names, and acronyms all work. Add a city or country if you get the wrong result."
     )
     searchBtn = st.button("Generate Map", type="primary", use_container_width=True)
+
+    with st.expander("How to use this map"):
+        st.markdown(
+            "- Use **Find a building** or **Find a road** below to jump straight there.\n"
+            "- Tap the location icon on the map (top right) to show where you are right now.\n"
+            "- Use the ruler icon (top left) to measure a real walking distance.\n"
+            "- Toggle layers below to declutter the map."
+        )
 
     st.divider()
     st.subheader("Layers")
@@ -803,3 +891,9 @@ campusMap = renderCampusMap(
 )
 
 campusMap.to_streamlit(height=620)
+
+if focusName and focusLoc:
+    nearby = nearbyLocations(focusLoc, focusName, st.session_state.get("namedLocations", {}))
+    if nearby:
+        chips = " · ".join(f"{n} ({int(round(d))}m)" for n, d in nearby)
+        st.caption(f"📍 Near **{focusName}**: {chips}")
