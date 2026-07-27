@@ -556,6 +556,12 @@ with st.sidebar:
     focusName = None
     focusRoad = None
 
+    def _clearRoadSelection():
+        st.session_state["road_select"] = None
+
+    def _clearBuildingSelection():
+        st.session_state["building_select"] = None
+
     if namedLocs or namedRds:
         st.divider()
         st.subheader("Navigate")
@@ -567,6 +573,8 @@ with st.sidebar:
                 sorted(namedLocs.keys()),
                 index=None,
                 placeholder="Type to search buildings...",
+                key="building_select",
+                on_change=_clearRoadSelection,
             )
             if selected:
                 focusName = selected
@@ -577,6 +585,8 @@ with st.sidebar:
                 sorted(namedRds.keys()),
                 index=None,
                 placeholder="Type to search roads...",
+                key="road_select",
+                on_change=_clearBuildingSelection,
             )
             if selectedRoad:
                 focusRoad = selectedRoad
@@ -686,23 +696,22 @@ branding_html = """
 <div style="
     position: fixed;
     top: 12px;
-    left: 50%;
-    transform: translateX(-50%);
+    left: 10px;
     z-index: 9999;
-    background: rgba(255,255,255,0.92);
-    backdrop-filter: blur(4px);
-    padding: 5px 14px;
-    border-radius: 20px;
-    box-shadow: 0 1px 6px rgba(0,0,0,0.18);
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    background: white;
+    padding: 6px 12px;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    font-family: sans-serif;
     font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    color: #1a1a2e;
+    font-weight: 600;
+    color: #333333;
+    line-height: 1.4;
     user-select: none;
     pointer-events: none;
 ">
-    <span style="color:#1f77b4;">Campus</span><span style="color:#ff6600;">Way</span>
+    <span style="display:inline-block;width:8px;height:8px;background:#1f77b4;
+                 border-radius:2px;margin-right:6px;"></span>CampusWay
 </div>
 {% endmacro %}
 """
