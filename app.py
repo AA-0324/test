@@ -226,6 +226,31 @@ def _mergeBounds(existing, south, west, north, east):
     return (min(es, south), min(ew, west), max(en, north), max(ee, east))
 
 
+def _geomBounds(geometry):
+    # walk a GeoJSON geometry's (possibly nested) coordinates to get min/max
+    # lon/lat -- works for LineString, MultiLineString, or anything else
+    # without caring about the specific nesting depth
+    if not geometry:
+        return None
+    pts = []
+
+    def _walk(c):
+        if not isinstance(c, (list, tuple)) or not c:
+            return
+        if isinstance(c[0], (int, float)):
+            pts.append(c)
+        else:
+            for sub in c:
+                _walk(sub)
+
+    _walk(geometry.get("coordinates"))
+    if not pts:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 def fetchRoadsAndWalkways(polygon_wkt):
     # ONE combined Overpass query for both roads and walkways (both are highway=*
     # tags, just different values) instead of two separate round-trips -- OSMnx
@@ -236,43 +261,49 @@ def fetchRoadsAndWalkways(polygon_wkt):
     try:
         gdf = ox.features_from_polygon(poly, tags={"highway": WALKWAY_VALUES + ROAD_VALUES})
         if gdf is None or gdf.empty or "highway" not in gdf.columns:
-            return None, None, {}
+            return None, None, {}, {}
         gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
         gdf = _simplify(gdf)
 
         walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
         roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
 
-        # named-road index: group by name and combine bounds across every segment
-        # sharing that name -- a single named road is often split into many
-        # disconnected OSM ways, so this must be a union of all of them, not just
-        # the first one found (unlike buildings, which are single polygons)
-        namedRoads = {}
-        namedRoadGeo = {}  # GeoJSON segments for highlighted rendering
-        for segment_gdf in (roads, walkways):
-            if segment_gdf.empty or "name" not in segment_gdf.columns:
-                continue
-            named_segments = segment_gdf[segment_gdf["name"].notna()]
-            for name, group in named_segments.groupby("name"):
-                name = str(name).strip()
-                if not name:
-                    continue
-                minx, miny, maxx, maxy = group.total_bounds
-                namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
-                # accumulate GeoJSON for highlight layer
-                geo_chunk = group.__geo_interface__
-                if name not in namedRoadGeo:
-                    namedRoadGeo[name] = geo_chunk
-                else:
-                    # merge feature lists
-                    existing_feats = namedRoadGeo[name].get("features", [])
-                    new_feats = geo_chunk.get("features", [])
-                    namedRoadGeo[name] = {"type": "FeatureCollection", "features": existing_feats + new_feats}
-
         walkways = addLabelAndTrim(walkways, "walkways")
         roads = addLabelAndTrim(roads, "roads")
         walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
         roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
+
+        # named-road index built directly from the SAME GeoJSON that gets
+        # rendered/tooltipped on the map (not a separate pre-trim pass over the
+        # raw dataframe) -- that guarantees every road the map labels with a
+        # real name is guaranteed to be findable in search, with no chance of
+        # the two falling out of sync. A single named road is often split into
+        # many disconnected OSM ways, so bounds/geometry are unioned across
+        # every segment sharing that name, not just the first one found.
+        namedRoads = {}
+        namedRoadGeo = {}
+        for geo in (roadGeo, walkGeo):
+            if not geo:
+                continue
+            for feat in geo.get("features", []):
+                props = feat.get("properties") or {}
+                if not props.get("HasName"):
+                    continue
+                name = props.get("Label")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                name = name.strip()
+
+                b = _geomBounds(feat.get("geometry"))
+                if b:
+                    minx, miny, maxx, maxy = b
+                    namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
+
+                if name not in namedRoadGeo:
+                    namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
+                else:
+                    namedRoadGeo[name]["features"].append(feat)
+
         return roadGeo, walkGeo, namedRoads, namedRoadGeo
     except Exception:
         return None, None, {}, {}
@@ -499,8 +530,7 @@ def addBranding(m):
                 background: white; padding: 8px 12px; border-radius: 4px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px;
                 font-family: sans-serif; line-height: 1.4; color: #333;">
-        <span style="display:inline-block;width:8px;height:8px;background:#1f77b4;
-                     border-radius:2px;margin-right:6px;"></span>CampusWay
+        CampusWay
     </div>
     {% endmacro %}
     """
