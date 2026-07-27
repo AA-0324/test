@@ -410,21 +410,14 @@ def findCampus(name):
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
-def buildCampusMap(polygon_wkt, active_layers, status):
+def prepareCampusData(polygon_wkt, active_layers, status):
+    """Fetch + shape everything the map needs. Pure data, no folium objects --
+    this is the only part that's slow (network calls), and it's cached by
+    fetchRoadsAndWalkways / fetchBuildingsAndFacilities so it only runs once
+    per campus, not on every sidebar interaction."""
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
-    cLat = (miny + maxy) / 2
-    cLon = (minx + maxx) / 2
-
-    m = leafmap.Map(center=[cLat, cLon], zoom=15, tiles="CartoDB.Positron")
-
-    folium_plugins.Fullscreen(
-        position="topright",
-        title="Expand map",
-        title_cancel="Exit fullscreen",
-        force_separate_button=True
-    ).add_to(m)
 
     layerData = {}
     namedRoads = {}
@@ -437,7 +430,8 @@ def buildCampusMap(polygon_wkt, active_layers, status):
             layerData["roads"] = roadGeo
         if "walkways" in active_layers:
             layerData["walkways"] = walkGeo
-        # namedRoadGeo is populated inside fetchRoadsAndWalkways above
+        status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
+                     f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
     bldGdf = facGdf = None
     if "buildings" in active_layers or "facilities" in active_layers:
@@ -448,11 +442,12 @@ def buildCampusMap(polygon_wkt, active_layers, status):
             layerData["buildings"] = bldGdf.__geo_interface__ if bldGdf is not None and not bldGdf.empty else None
         if "facilities" in active_layers:
             layerData["facilities"] = facGdf.__geo_interface__ if facGdf is not None and not facGdf.empty else None
+        status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
+                     f"Facilities: {len(facGdf) if facGdf is not None else 0}")
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     counts = {}
     foundAnything = False
-
     for k in drawOrder:
         if k not in layerData:
             continue
@@ -461,16 +456,12 @@ def buildCampusMap(polygon_wkt, active_layers, status):
             counts[k] = 0
             continue
         counts[k] = len(geo["features"])
-        folium.GeoJson(
-            data=geo,
-            name=layer_labels[k],
-            style_function=campusStyles[k],
-            tooltip=makeTooltip(),
-        ).add_to(m)
         foundAnything = True
 
     if not foundAnything:
         raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
+
+    status.write("Indexing named buildings and roads for search...")
 
     # named-building index for the "Find a building" search -- real OSM names only,
     # decorated with category so searching "library" or "cafe" surfaces matches
@@ -495,7 +486,61 @@ def buildCampusMap(polygon_wkt, active_layers, status):
             except Exception:
                 continue
 
-    m.fit_bounds([[miny, minx], [maxy, maxx]])
+    bounds = (miny, minx, maxy, maxx)
+    return layerData, counts, namedLocations, namedRoads, namedRoadGeo, bounds
+
+
+def addBranding(m):
+    # bottom-right: clear of the zoom control (top-left), Fullscreen button
+    # (top-right), and our own legend (bottom-left)
+    branding_html = """
+    {% macro html(this, kwargs) %}
+    <div style="position: fixed; bottom: 10px; right: 10px; z-index: 9999;
+                background: white; padding: 8px 12px; border-radius: 4px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px;
+                font-family: sans-serif; line-height: 1.4; color: #333;">
+        <span style="display:inline-block;width:8px;height:8px;background:#1f77b4;
+                     border-radius:2px;margin-right:6px;"></span>CampusWay
+    </div>
+    {% endmacro %}
+    """
+    branding = MacroElement()
+    branding._template = Template(branding_html)
+    m.get_root().add_child(branding)
+
+
+def renderCampusMap(layerData, counts, bounds, focusName=None, focusLoc=None,
+                     focusRoad=None, focusRoadBounds=None, focusRoadGeo=None):
+    """Builds a brand new folium map every call. Cheap: no network calls, just
+    re-attaches already-fetched GeoJSON. Building fresh (instead of mutating
+    a single map object stored across reruns) is what keeps this fast --
+    a reused, endlessly-mutated map object accumulates every fit_bounds/marker/
+    highlight ever added across the whole session and grinds the browser
+    to a halt after a few clicks."""
+    miny, minx, maxy, maxx = bounds
+    cLat = (miny + maxy) / 2
+    cLon = (minx + maxx) / 2
+
+    m = leafmap.Map(center=[cLat, cLon], zoom=15, tiles="CartoDB.Positron")
+
+    folium_plugins.Fullscreen(
+        position="topright",
+        title="Expand map",
+        title_cancel="Exit fullscreen",
+        force_separate_button=True
+    ).add_to(m)
+
+    drawOrder = ["roads", "walkways", "buildings", "facilities"]
+    for k in drawOrder:
+        geo = layerData.get(k)
+        if not geo or not geo.get("features"):
+            continue
+        folium.GeoJson(
+            data=geo,
+            name=layer_labels[k],
+            style_function=campusStyles[k],
+            tooltip=makeTooltip(),
+        ).add_to(m)
 
     rendered = [k for k in drawOrder if counts.get(k, 0) > 0]
     if rendered:
@@ -519,7 +564,42 @@ def buildCampusMap(polygon_wkt, active_layers, status):
         legend._template = Template(legend_html)
         m.get_root().add_child(legend)
 
-    return m, counts, namedLocations, namedRoads, namedRoadGeo
+    addBranding(m)
+
+    if focusName and focusLoc:
+        flat, flon = focusLoc
+        pad = 0.0012
+        m.fit_bounds([[flat - pad, flon - pad], [flat + pad, flon + pad]])
+        folium.CircleMarker(
+            location=[flat, flon],
+            radius=16,
+            color="#ff6600",
+            weight=3,
+            fill=True,
+            fill_color="#ff6600",
+            fill_opacity=0.15,
+            tooltip=folium.Tooltip(focusName),
+        ).add_to(m)
+    elif focusRoad and focusRoadBounds:
+        s, w, n, e = focusRoadBounds
+        padLat = max((n - s) * 0.15, 0.0005)
+        padLon = max((e - w) * 0.15, 0.0005)
+        m.fit_bounds([[s - padLat, w - padLon], [n + padLat, e + padLon]])
+        if focusRoadGeo:
+            folium.GeoJson(
+                data=focusRoadGeo,
+                name="__highlight__",
+                style_function=lambda feat: {
+                    "color": "#ff6600",
+                    "weight": 6,
+                    "opacity": 0.9,
+                },
+                tooltip=folium.Tooltip(focusRoad),
+            ).add_to(m)
+    else:
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+    return m
 
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
@@ -598,7 +678,7 @@ if searchBtn and campusInput.strip():
     newSearch = campusInput.strip()
     if newSearch != st.session_state.get("lastSearch", ""):
         st.session_state["lastSearch"] = newSearch
-        st.session_state.pop("campusMap", None)
+        st.session_state.pop("campusData", None)
         st.session_state.pop("namedLocations", None)
         st.session_state.pop("namedRoads", None)
         st.session_state.pop("namedRoadGeo", None)
@@ -609,12 +689,13 @@ if not searchTerm:
     st.info("Enter a university or college name in the sidebar and click **Generate Map** to get started.")
     st.stop()
 
-if "campusMap" not in st.session_state:
+if "campusData" not in st.session_state:
     err = None
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
             campusName, campusPoly = findCampus(searchTerm)
             status.update(label=f"Found: {campusName}", state="running")
+            status.write(f"Matched: {campusName}")
         except ValueError as e:
             status.update(label="Could not find campus", state="error")
             err = ("error", str(e))
@@ -628,8 +709,14 @@ if "campusMap" not in st.session_state:
 
         if err is None:
             try:
-                campusMap, layerCounts, namedLocations, namedRoads, namedRoadGeo = buildCampusMap(campusPoly, active_layers, status)
-                st.session_state["campusMap"] = campusMap
+                layerData, layerCounts, namedLocations, namedRoads, namedRoadGeo, bounds = \
+                    prepareCampusData(campusPoly, active_layers, status)
+                st.session_state["campusData"] = {
+                    "layerData": layerData,
+                    "counts": layerCounts,
+                    "bounds": bounds,
+                    "campusName": campusName,
+                }
                 st.session_state["namedLocations"] = namedLocations
                 st.session_state["namedRoads"] = namedRoads
                 st.session_state["namedRoadGeo"] = namedRoadGeo
@@ -655,68 +742,34 @@ if "campusMap" not in st.session_state:
     # unrelated later interaction happened to trigger another rerun
     st.rerun()
 
-campusMap = st.session_state["campusMap"]
+campusData = st.session_state["campusData"]
 
+focusLoc = None
 if focusName and focusName in st.session_state.get("namedLocations", {}):
-    flat, flon = st.session_state["namedLocations"][focusName]
-    pad = 0.0012
-    campusMap.fit_bounds([[flat - pad, flon - pad], [flat + pad, flon + pad]])
-    folium.CircleMarker(
-        location=[flat, flon],
-        radius=16,
-        color="#ff6600",
-        weight=3,
-        fill=True,
-        fill_color="#ff6600",
-        fill_opacity=0.15,
-        tooltip=folium.Tooltip(focusName),
-    ).add_to(campusMap)
-elif focusRoad and focusRoad in st.session_state.get("namedRoads", {}):
-    s, w, n, e = st.session_state["namedRoads"][focusRoad]
-    padLat = max((n - s) * 0.15, 0.0005)
-    padLon = max((e - w) * 0.15, 0.0005)
-    campusMap.fit_bounds([[s - padLat, w - padLon], [n + padLat, e + padLon]])
-    # highlight the matched road segments with a vivid overlay
-    roadGeoData = st.session_state.get("namedRoadGeo", {}).get(focusRoad)
-    if roadGeoData:
-        folium.GeoJson(
-            data=roadGeoData,
-            name="__highlight__",
-            style_function=lambda feat: {
-                "color": "#ff6600",
-                "weight": 6,
-                "opacity": 0.85,
-            },
-            tooltip=folium.Tooltip(focusRoad),
-        ).add_to(campusMap)
+    focusLoc = st.session_state["namedLocations"][focusName]
+else:
+    focusName = None
 
-# ── CampusWay branding (map overlay) ─────────────────────────────────────────
-branding_html = """
-{% macro html(this, kwargs) %}
-<div style="
-    position: fixed;
-    top: 12px;
-    left: 10px;
-    z-index: 9999;
-    background: white;
-    padding: 6px 12px;
-    border-radius: 4px;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
-    font-family: sans-serif;
-    font-size: 13px;
-    font-weight: 600;
-    color: #333333;
-    line-height: 1.4;
-    user-select: none;
-    pointer-events: none;
-">
-    <span style="display:inline-block;width:8px;height:8px;background:#1f77b4;
-                 border-radius:2px;margin-right:6px;"></span>CampusWay
-</div>
-{% endmacro %}
-"""
-branding = MacroElement()
-branding._template = Template(branding_html)
-campusMap.get_root().add_child(branding)
+focusRoadBounds = None
+focusRoadGeo = None
+if focusRoad and focusRoad in st.session_state.get("namedRoads", {}):
+    focusRoadBounds = st.session_state["namedRoads"][focusRoad]
+    focusRoadGeo = st.session_state.get("namedRoadGeo", {}).get(focusRoad)
+else:
+    focusRoad = None
+
+# a brand new map is built on every run instead of reusing/mutating one
+# stored object -- that's what keeps this fast and keeps focus/highlight
+# state correct no matter which building or road was picked last
+campusMap = renderCampusMap(
+    campusData["layerData"],
+    campusData["counts"],
+    campusData["bounds"],
+    focusName=focusName,
+    focusLoc=focusLoc,
+    focusRoad=focusRoad,
+    focusRoadBounds=focusRoadBounds,
+    focusRoadGeo=focusRoadGeo,
+)
 
 campusMap.to_streamlit(height=620)
