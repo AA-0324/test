@@ -199,7 +199,10 @@ def addLabelAndTrim(gdf, layer_key):
         return gdf
 
 
-SIMPLIFY_TOLERANCE = 0.000015  # ~1.5m at typical campus latitudes -- conservative enough to not visibly distort shapes
+SIMPLIFY_TOLERANCE = 0.00004  # ~4.4m at typical campus latitudes -- was 1.5m;
+# bumped up because vertex count is the dominant cost in every single render
+# (this map is rebuilt from scratch on every sidebar interaction), and sub-2m
+# precision is invisible at the zoom levels this app is actually used at
 
 
 def _simplify(gdf):
@@ -508,27 +511,28 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     namedRoads = {}
     namedRoadGeo = {}
 
-    if "roads" in active_layers or "walkways" in active_layers:
-        status.update(label="Fetching roads and pedestrian paths...")
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
-        if "roads" in active_layers:
-            layerData["roads"] = roadGeo
-        if "walkways" in active_layers:
-            layerData["walkways"] = walkGeo
-        status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
-                     f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
+    # NOTE: always fetch + store BOTH members of each pair, regardless of which
+    # boxes are checked right now. The Overpass query already pulls both
+    # members together (it's one combined query), so this costs nothing extra
+    # over the network -- and it's the fix for sidebar toggles doing nothing:
+    # previously the untouched half of a pair was fetched and immediately
+    # thrown away, so checking it later had no data to show without a full
+    # re-fetch. Now everything is kept, and which layers are actually drawn is
+    # decided fresh at render time from the live checkbox state.
+    status.update(label="Fetching roads and pedestrian paths...")
+    roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+    layerData["roads"] = roadGeo
+    layerData["walkways"] = walkGeo
+    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
+                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
-    bldGdf = facGdf = None
-    if "buildings" in active_layers or "facilities" in active_layers:
-        status.update(label="Fetching buildings and facilities...")
-        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
-        if "buildings" in active_layers:
-            bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
-            layerData["buildings"] = _roundGeoJson(bldGdf.__geo_interface__) if bldGdf is not None and not bldGdf.empty else None
-        if "facilities" in active_layers:
-            layerData["facilities"] = _roundGeoJson(facGdf.__geo_interface__) if facGdf is not None and not facGdf.empty else None
-        status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
-                     f"Facilities: {len(facGdf) if facGdf is not None else 0}")
+    status.update(label="Fetching buildings and facilities...")
+    bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+    bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
+    layerData["buildings"] = _roundGeoJson(bldGdf.__geo_interface__) if bldGdf is not None and not bldGdf.empty else None
+    layerData["facilities"] = _roundGeoJson(facGdf.__geo_interface__) if facGdf is not None and not facGdf.empty else None
+    status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
+                 f"Facilities: {len(facGdf) if facGdf is not None else 0}")
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     counts = {}
@@ -593,14 +597,19 @@ def addBranding(m):
     m.get_root().add_child(branding)
 
 
-def renderCampusMap(layerData, counts, bounds, focusName=None, focusLoc=None,
+def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, focusLoc=None,
                      focusRoad=None, focusRoadBounds=None, focusRoadGeo=None):
     """Builds a brand new folium map every call. Cheap: no network calls, just
     re-attaches already-fetched GeoJSON. Building fresh (instead of mutating
     a single map object stored across reruns) is what keeps this fast --
     a reused, endlessly-mutated map object accumulates every fit_bounds/marker/
     highlight ever added across the whole session and grinds the browser
-    to a halt after a few clicks."""
+    to a halt after a few clicks.
+
+    visibleLayers is read fresh from the sidebar checkboxes on every single
+    call, so which layers actually get drawn always matches their current
+    state -- this is what makes the sidebar toggles work, since layerData
+    itself always contains everything that was ever fetched."""
     miny, minx, maxy, maxx = bounds
     cLat = (miny + maxy) / 2
     cLon = (minx + maxx) / 2
@@ -632,16 +641,10 @@ def renderCampusMap(layerData, counts, bounds, focusName=None, focusLoc=None,
         flyTo=True,
     ).add_to(m)
 
-    # lets a student drag out a line/area on the map to see the real
-    # walking distance, e.g. "is it faster to cut through the quad?"
-    folium_plugins.MeasureControl(
-        position="topleft",
-        primary_length_unit="meters",
-        secondary_length_unit="feet",
-    ).add_to(m)
-
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     for k in drawOrder:
+        if k not in visibleLayers:
+            continue
         geo = layerData.get(k)
         if not geo or not geo.get("features"):
             continue
@@ -652,7 +655,7 @@ def renderCampusMap(layerData, counts, bounds, focusName=None, focusLoc=None,
             tooltip=makeTooltip(),
         ).add_to(m)
 
-    rendered = [k for k in drawOrder if counts.get(k, 0) > 0]
+    rendered = [k for k in drawOrder if k in visibleLayers and counts.get(k, 0) > 0]
     if rendered:
         rows = "".join(
             f'<div style="margin:2px 0;">'
@@ -729,8 +732,7 @@ with st.sidebar:
         st.markdown(
             "- Use **Find a building** or **Find a road** below to jump straight there.\n"
             "- Tap the location icon on the map (top right) to show where you are right now.\n"
-            "- Use the ruler icon (top left) to measure a real walking distance.\n"
-            "- Toggle layers below to declutter the map."
+            "- Toggle layers below to show or hide what's on the map."
         )
 
     st.divider()
@@ -883,6 +885,7 @@ campusMap = renderCampusMap(
     campusData["layerData"],
     campusData["counts"],
     campusData["bounds"],
+    visibleLayers=set(active_layers),
     focusName=focusName,
     focusLoc=focusLoc,
     focusRoad=focusRoad,
