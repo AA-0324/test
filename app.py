@@ -114,7 +114,7 @@ def looksLikeCampus(nominatimResult):
     return any(hint in dn.lower() for hint in campusNameHints)
 
 
-def queryNominatim(q, limit=5):
+def queryNominatim(q, limit=5, _status=None):
     p = {
         "q": q,
         "format": "jsonv2",
@@ -122,22 +122,51 @@ def queryNominatim(q, limit=5):
         "addressdetails": 1,
         "polygon_geojson": 1,
     }
-    throttleNominatim()
-    r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
 
-    if r.status_code == 429:
-        time.sleep(3)
-        r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
+    # A single retry after a fixed 3s wasn't enough -- on shared cloud hosting,
+    # Nominatim's "1 request/sec" limit is enforced per source IP, and other
+    # apps/tenants on the same host can burn that budget before we even make
+    # our first request. The fix isn't a longer fixed wait, it's actually
+    # retrying several times with real backoff (and honoring the Retry-After
+    # header when the server sends one) instead of giving up almost instantly.
+    maxAttempts = 5
+    backoffs = [2, 4, 8, 15]  # seconds, used when the server gives no Retry-After
 
-    if r.status_code == 429:
-        raise ValueError(
-            "OpenStreetMap's free search service is rate-limiting requests right now "
-            "(HTTP 429). This is common on shared cloud hosting and isn't caused by "
-            "this app directly. It usually clears on its own -- try again shortly."
-        )
+    for attempt in range(maxAttempts):
+        throttleNominatim()
+        try:
+            r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
+        except requests.exceptions.RequestException:
+            if attempt == maxAttempts - 1:
+                raise
+            time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+            continue
 
-    r.raise_for_status()
-    return r.json()
+        if r.status_code != 429:
+            r.raise_for_status()
+            return r.json()
+
+        if attempt == maxAttempts - 1:
+            break
+
+        retryAfter = r.headers.get("Retry-After")
+        try:
+            wait = float(retryAfter) if retryAfter is not None else backoffs[min(attempt, len(backoffs) - 1)]
+        except ValueError:
+            wait = backoffs[min(attempt, len(backoffs) - 1)]
+        wait = min(wait, 20)  # don't let a server-suggested wait stall the app forever
+
+        if _status is not None:
+            _status.write(f"OpenStreetMap is rate-limiting requests -- retrying in {int(wait)}s "
+                           f"(attempt {attempt + 1}/{maxAttempts})...")
+        time.sleep(wait)
+
+    raise ValueError(
+        "OpenStreetMap's free search service is rate-limiting requests right now "
+        "(HTTP 429), even after several retries. This is common on shared cloud "
+        "hosting where many apps share the same IP address. It usually clears on "
+        "its own within a minute or two -- please try again shortly."
+    )
 
 
 FALLBACK_TAG = {
@@ -434,8 +463,8 @@ def _alternateNameGuess(name):
     return f"{rest.strip()} {kind.title()}"
 
 
-def findCampus(name):
-    results = queryNominatim(name)
+def findCampus(name, _status=None):
+    results = queryNominatim(name, _status=_status)
     if not results:
         raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
 
@@ -446,7 +475,7 @@ def findCampus(name):
         alt = _alternateNameGuess(name)
         if alt:
             try:
-                altResults = queryNominatim(alt)
+                altResults = queryNominatim(alt, _status=_status)
                 altResults.sort(key=lambda r: not looksLikeCampus(r))
                 altEduHits = [r for r in altResults if looksLikeCampus(r)]
                 if altEduHits:
@@ -479,10 +508,28 @@ def findCampus(name):
     top_hit = edu_hits[0]
     hitName = top_hit.get("display_name", name)
 
+    # Prefer a direct OSM-ID lookup over re-searching by name: it's the exact
+    # same place we already matched, hits Nominatim's lighter "lookup"
+    # endpoint instead of a fresh fuzzy "search", and avoids burning a second
+    # full search request against an already-strained rate limit.
+    osmType = top_hit.get("osm_type")
+    osmId = top_hit.get("osm_id")
+    typePrefix = {"node": "N", "way": "W", "relation": "R"}.get(osmType)
+
+    gdf = None
     try:
         throttleNominatim()
-        gdf = ox.geocode_to_gdf(hitName)
+        if typePrefix and osmId:
+            gdf = ox.geocode_to_gdf(f"{typePrefix}{osmId}", by_osmid=True)
+        else:
+            gdf = ox.geocode_to_gdf(hitName)
     except Exception as e:
+        if "429" in str(e):
+            raise ValueError(
+                "OpenStreetMap's free search service is rate-limiting requests right now "
+                "(HTTP 429), even after retrying. It usually clears on its own within a "
+                "minute or two -- please try again shortly."
+            )
         raise ValueError(f'Found **"{hitName}"** but could not get its boundary.\n\nError: `{e}`')
 
     if gdf.empty or gdf.iloc[0].geometry.geom_type not in ("Polygon", "MultiPolygon"):
@@ -813,7 +860,7 @@ if "campusData" not in st.session_state:
     err = None
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            campusName, campusPoly = findCampus(searchTerm)
+            campusName, campusPoly = findCampus(searchTerm, _status=status)
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
         except ValueError as e:
