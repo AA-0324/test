@@ -688,6 +688,14 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         flyTo=True,
     ).add_to(m)
 
+    # lets a student drag out a line/area on the map to see the real
+    # walking distance, e.g. "is it faster to cut through the quad?"
+    folium_plugins.MeasureControl(
+        position="topleft",
+        primary_length_unit="meters",
+        secondary_length_unit="feet",
+    ).add_to(m)
+
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     for k in drawOrder:
         if k not in visibleLayers:
@@ -779,6 +787,7 @@ with st.sidebar:
         st.markdown(
             "- Use **Find a building** or **Find a road** below to jump straight there.\n"
             "- Tap the location icon on the map (top right) to show where you are right now.\n"
+            "- Use the ruler icon (top left) to measure a real walking distance.\n"
             "- Toggle layers below to show or hide what's on the map."
         )
 
