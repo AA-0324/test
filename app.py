@@ -9,6 +9,7 @@ import time
 import html
 import re
 import requests
+from collections import deque
 import pandas as pd
 import geopandas as gpd
 import folium
@@ -286,6 +287,60 @@ def nearbyLocations(focusLoc, focusName, allLocs, maxResults=4, maxMeters=300):
     return out[:maxResults]
 
 
+def _editDistance(a, b):
+    # classic Levenshtein edit distance (single-row DP) -- a freshman on a
+    # campus they've never seen doesn't know a building's exact official
+    # name or spelling, and typos happen on a phone keyboard constantly.
+    # This is what makes "libary" or "student unio" still find the right
+    # building instead of returning nothing.
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[lb]
+
+
+def _fuzzyScore(query, candidate):
+    q = query.lower().strip()
+    c = candidate.lower()
+    if not q:
+        return 0
+    if q in c:
+        # a direct substring hit is a very strong signal -- rank earlier,
+        # tighter matches above later, looser ones
+        return 1000 - c.index(q) - abs(len(c) - len(q)) * 0.1
+    # typo-tolerant fallback: compare the query against the whole candidate
+    # AND against each individual word in it, so "libary" still matches
+    # "Central Library (Library)" even though the full strings differ a lot
+    words = re.split(r"[\s()]+", c)
+    candidates = [w for w in words if w] + [c]
+    bestWord, best = min(((w, _editDistance(q, w)) for w in candidates), key=lambda t: t[1])
+    # how many edits count as "a plausible typo" scales with word length --
+    # 2 edits is reasonable on a 10-letter word, not on a 4-letter one, so a
+    # flat cutoff would either miss real typos or return unrelated junk
+    maxAllowed = max(1, min(len(q), len(bestWord)) // 2)
+    if best > maxAllowed:
+        return 0
+    return 500 - best * 40
+
+
+def fuzzySearch(query, names, limit=6, minScore=1):
+    scored = [(n, _fuzzyScore(query, n)) for n in names]
+    scored = [t for t in scored if t[1] >= minScore]
+    scored.sort(key=lambda t: -t[1])
+    return [n for n, _ in scored[:limit]]
+
+
 def _geomBounds(geometry):
     # walk a GeoJSON geometry's (possibly nested) coordinates to get min/max
     # lon/lat -- works for LineString, MultiLineString, or anything else
@@ -351,6 +406,78 @@ def _stripUnusedProps(geo, keep=("Label",)):
     return geo
 
 
+def _segmentEndpoints(geometry):
+    # the two (or more, for MultiLineString) endpoint coordinates of a road
+    # segment -- used purely to detect "these two OSM ways physically touch",
+    # since OSM ways that share a real-world junction share an identical
+    # coordinate at that point
+    if not geometry:
+        return []
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if not coords:
+        return []
+    pts = []
+    if gtype == "LineString" and coords:
+        pts.append(tuple(coords[0][:2]))
+        pts.append(tuple(coords[-1][:2]))
+    elif gtype == "MultiLineString":
+        for line in coords:
+            if line:
+                pts.append(tuple(line[0][:2]))
+                pts.append(tuple(line[-1][:2]))
+    return pts
+
+
+def _propagateRoadNames(features, maxHops=6):
+    """Real campus roads are almost always mapped in OSM as many small,
+    disconnected ways -- a driveway stub here, a service-road fork there --
+    and typically only ONE of those ways actually carries the `name` tag,
+    even though they're all physically the same strip of pavement. Left as
+    literal name-tag matches, that means a named road is only ever partly
+    searchable and only ever partly highlighted (exactly the two bugs this
+    fixes).
+
+    This is a multi-source breadth-first search: start from every segment
+    that already has a real name, and spread that name outward through
+    directly-touching (shared-endpoint) segments that have NO name of their
+    own -- never through a segment that already carries a *different* name,
+    so two genuinely different named roads that happen to meet at an
+    intersection never bleed into each other. Hop-limited so one named road
+    can't accidentally swallow an entire unrelated service-road network many
+    junctions away.
+
+    Returns {feature_index: effective_name}."""
+    endpointOwners = {}
+    for i, feat in enumerate(features):
+        for pt in _segmentEndpoints(feat.get("geometry")):
+            endpointOwners.setdefault(pt, []).append(i)
+
+    effectiveName = {}
+    queue = deque()
+    for i, feat in enumerate(features):
+        props = feat.get("properties") or {}
+        if props.get("HasName"):
+            name = (props.get("Label") or "").strip()
+            if name:
+                effectiveName[i] = name
+                queue.append((i, 0))
+
+    while queue:
+        i, hops = queue.popleft()
+        if hops >= maxHops:
+            continue
+        name = effectiveName[i]
+        for pt in _segmentEndpoints(features[i].get("geometry")):
+            for j in endpointOwners.get(pt, ()):
+                if j in effectiveName:
+                    continue  # already named -- its own name, or already claimed
+                effectiveName[j] = name
+                queue.append((j, hops + 1))
+
+    return effectiveName
+
+
 def fetchRoadsAndWalkways(polygon_wkt):
     # ONE combined Overpass query for both roads and walkways (both are highway=*
     # tags, just different values) instead of two separate round-trips -- OSMnx
@@ -377,34 +504,35 @@ def fetchRoadsAndWalkways(polygon_wkt):
 
         # named-road index built directly from the SAME GeoJSON that gets
         # rendered/tooltipped on the map (not a separate pre-trim pass over the
-        # raw dataframe) -- that guarantees every road the map labels with a
-        # real name is guaranteed to be findable in search, with no chance of
-        # the two falling out of sync. A single named road is often split into
-        # many disconnected OSM ways, so bounds/geometry are unioned across
-        # every segment sharing that name, not just the first one found.
+        # raw dataframe) -- that guarantees every road the map draws is
+        # guaranteed to be consistent with what's searchable. Names are
+        # propagated across touching unnamed segments first (see
+        # _propagateRoadNames) so a road split into many partially-tagged OSM
+        # ways is treated -- and highlighted -- as the single connected road
+        # it actually is, not just whichever fragment happened to carry the tag.
+        allFeatures = []
+        for geo in (roadGeo, walkGeo):
+            if geo:
+                allFeatures.extend(geo.get("features", []))
+
+        effectiveNames = _propagateRoadNames(allFeatures)
+
         namedRoads = {}
         namedRoadGeo = {}
-        for geo in (roadGeo, walkGeo):
-            if not geo:
+        for i, feat in enumerate(allFeatures):
+            name = effectiveNames.get(i)
+            if not name:
                 continue
-            for feat in geo.get("features", []):
-                props = feat.get("properties") or {}
-                if not props.get("HasName"):
-                    continue
-                name = props.get("Label")
-                if not isinstance(name, str) or not name.strip():
-                    continue
-                name = name.strip()
 
-                b = _geomBounds(feat.get("geometry"))
-                if b:
-                    minx, miny, maxx, maxy = b
-                    namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
+            b = _geomBounds(feat.get("geometry"))
+            if b:
+                minx, miny, maxx, maxy = b
+                namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
 
-                if name not in namedRoadGeo:
-                    namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
-                else:
-                    namedRoadGeo[name]["features"].append(feat)
+            if name not in namedRoadGeo:
+                namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
+            else:
+                namedRoadGeo[name]["features"].append(feat)
 
         # done building the search index off HasName/Label -- now drop every
         # property except Label from what actually gets shipped to render
@@ -809,7 +937,7 @@ with st.sidebar:
 
     with st.expander("How to use this map"):
         st.markdown(
-            "- Use **Find a building** or **Find a road** below to jump straight there.\n"
+            "- Use **Quick search** below to jump to a building or road, even if you don't spell it exactly right.\n"
             "- Tap the location icon on the map (top right) to show where you are right now.\n"
             "- Use the ruler icon (top left) to measure a real walking distance.\n"
             "- Toggle layers below to show or hide what's on the map."
@@ -845,7 +973,31 @@ with st.sidebar:
     if namedLocs or namedRds:
         st.divider()
         st.subheader("Navigate")
-        st.caption("Type a building or road name to jump straight to it.")
+
+        quickQuery = st.text_input(
+            "Quick search (handles typos)",
+            key="quick_search",
+            placeholder='e.g. "libary" or "quad"',
+        )
+        if quickQuery.strip():
+            allNames = {n: "building" for n in namedLocs}
+            allNames.update({n: "road" for n in namedRds})
+            matches = fuzzySearch(quickQuery, list(allNames.keys()))
+            if matches:
+                for m in matches:
+                    kind = allNames[m]
+                    icon = "🏢" if kind == "building" else "🛣️"
+                    if st.button(f"{icon} {m}", key=f"quick_pick_{kind}_{m}", use_container_width=True):
+                        if kind == "building":
+                            st.session_state["building_select"] = m
+                            st.session_state["road_select"] = None
+                        else:
+                            st.session_state["road_select"] = m
+                            st.session_state["building_select"] = None
+            else:
+                st.caption("No matches -- try a different spelling.")
+
+        st.caption("Or browse the full list:")
 
         if namedLocs:
             selected = st.selectbox(
