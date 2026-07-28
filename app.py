@@ -228,10 +228,10 @@ def addLabelAndTrim(gdf, layer_key):
         return gdf
 
 
-SIMPLIFY_TOLERANCE = 0.00004  # ~4.4m at typical campus latitudes -- was 1.5m;
-# bumped up because vertex count is the dominant cost in every single render
-# (this map is rebuilt from scratch on every sidebar interaction), and sub-2m
-# precision is invisible at the zoom levels this app is actually used at
+SIMPLIFY_TOLERANCE = 0.00005  # ~5.5m at typical campus latitudes -- was 4.4m;
+# vertex count is the dominant cost in every single render (this map is
+# rebuilt from scratch on every sidebar interaction), and sub-2m precision is
+# invisible at the zoom levels this app is actually used at
 
 
 def _simplify(gdf):
@@ -311,13 +311,14 @@ def _geomBounds(geometry):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _roundGeoJson(geo, precision=6):
+def _roundGeoJson(geo, precision=5):
     # OSM/shapely coordinates default to ~15-17 significant digits when
-    # serialized -- that's sub-millimeter precision nobody navigating on foot
-    # needs. Rounding to 6 decimal places (~11cm at campus latitudes) cuts the
-    # GeoJSON payload roughly in half with zero visible difference, which
-    # directly cuts caching time, network transfer to the browser, and the
-    # browser's own JSON-parse + render time.
+    # serialized -- way beyond what matters for someone navigating on foot.
+    # 5 decimal places is ~1.1m at campus latitudes: comfortably inside a
+    # phone's own GPS accuracy, so there's no real-world precision lost, and
+    # it shrinks the GeoJSON payload substantially, which directly cuts
+    # caching time, network transfer to the browser, and the browser's own
+    # JSON-parse + render time.
     if not geo:
         return geo
 
@@ -332,6 +333,21 @@ def _roundGeoJson(geo, precision=6):
         geom = feat.get("geometry")
         if geom and geom.get("coordinates") is not None:
             geom["coordinates"] = _round(geom["coordinates"])
+    return geo
+
+
+def _stripUnusedProps(geo, keep=("Label",)):
+    # Only "Label" is ever read client-side, by the hover tooltip. HasName,
+    # Category, and osmid exist purely to help build the search index
+    # server-side (see fetchRoadsAndWalkways / namedLocations) and have zero
+    # use after that -- shipping them to the browser on every single feature
+    # is pure waste, and it adds up fast across thousands of features.
+    if not geo:
+        return geo
+    for feat in geo.get("features", []):
+        props = feat.get("properties")
+        if props:
+            feat["properties"] = {k: v for k, v in props.items() if k in keep}
     return geo
 
 
@@ -389,6 +405,11 @@ def fetchRoadsAndWalkways(polygon_wkt):
                     namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
                 else:
                     namedRoadGeo[name]["features"].append(feat)
+
+        # done building the search index off HasName/Label -- now drop every
+        # property except Label from what actually gets shipped to render
+        roadGeo = _stripUnusedProps(roadGeo)
+        walkGeo = _stripUnusedProps(walkGeo)
 
         return roadGeo, walkGeo, namedRoads, namedRoadGeo
     except Exception:
@@ -576,8 +597,8 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     status.update(label="Fetching buildings and facilities...")
     bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
-    layerData["buildings"] = _roundGeoJson(bldGdf.__geo_interface__) if bldGdf is not None and not bldGdf.empty else None
-    layerData["facilities"] = _roundGeoJson(facGdf.__geo_interface__) if facGdf is not None and not facGdf.empty else None
+    layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
+    layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
     status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
                  f"Facilities: {len(facGdf) if facGdf is not None else 0}")
 
@@ -708,6 +729,9 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
             name=layer_labels[k],
             style_function=campusStyles[k],
             tooltip=makeTooltip(),
+            smooth_factor=1.5,  # a bit more render-time line simplification in
+                                 # Leaflet itself -- imperceptible at the zoom
+                                 # levels this app is used at, cheaper to draw
         ).add_to(m)
 
     rendered = [k for k in drawOrder if k in visibleLayers and counts.get(k, 0) > 0]
