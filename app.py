@@ -14,7 +14,7 @@ import pandas as pd
 import geopandas as gpd
 import folium
 from branca.element import MacroElement, Template
-from shapely.geometry import shape
+from shapely.geometry import shape, box as shapelyBox
 from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
@@ -113,6 +113,51 @@ def looksLikeCampus(nominatimResult):
     if not isinstance(dn, str):
         dn = str(dn)
     return any(hint in dn.lower() for hint in campusNameHints)
+
+
+PHOTON_URL = "https://photon.komoot.io/api/"
+
+
+def queryPhoton(q, limit=5):
+    # Komoot's Photon is a completely separate service/infrastructure built
+    # on OSM data -- different servers, different rate-limit bucket from
+    # Nominatim. It's not a full replacement (no detailed boundary polygons,
+    # just a point + a rough bounding box), but when Nominatim itself is
+    # having a bad moment, having ANY independent path to try is the
+    # difference between a hard failure and a working, if slightly less
+    # precise, result.
+    p = {"q": q, "limit": limit}
+    r = requests.get(PHOTON_URL, params=p, headers=req_headers, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+
+    out = []
+    for feat in data.get("features", []):
+        props = feat.get("properties") or {}
+        geom = feat.get("geometry") or {}
+        coords = geom.get("coordinates")
+        name = props.get("name") or q
+        parts = [name, props.get("city"), props.get("state"), props.get("country")]
+        display_name = ", ".join(x for x in parts if x)
+
+        boundingbox = None
+        extent = props.get("extent")  # Photon: [minLon, maxLat, maxLon, minLat]
+        if extent and len(extent) == 4:
+            minLon, maxLat, maxLon, minLat = extent
+            boundingbox = [str(minLat), str(maxLat), str(minLon), str(maxLon)]
+
+        out.append({
+            "class": props.get("osm_key"),
+            "type": props.get("osm_value"),
+            "display_name": display_name,
+            "osm_type": props.get("osm_type"),
+            "osm_id": props.get("osm_id"),
+            "geojson": None,  # Photon doesn't return full boundary polygons
+            "boundingbox": boundingbox,
+            "lat": coords[1] if coords else None,
+            "lon": coords[0] if coords else None,
+        })
+    return out
 
 
 def queryNominatim(q, limit=5, _status=None):
@@ -613,7 +658,20 @@ def _alternateNameGuess(name):
 
 
 def findCampus(name, _status=None):
-    results = queryNominatim(name, _status=_status)
+    try:
+        results = queryNominatim(name, _status=_status)
+    except ValueError as nomErr:
+        # Nominatim's search step itself is failing (e.g. rate-limited) even
+        # after real retries -- try a fully independent service before
+        # giving up entirely, instead of failing outright on one provider
+        # having a bad moment
+        if _status is not None:
+            _status.write("OpenStreetMap search is unavailable -- trying a backup search service...")
+        try:
+            results = queryPhoton(name)
+        except Exception:
+            raise nomErr  # the original Nominatim error is more specific -- surface that, not the backup's
+
     if not results:
         raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
 
@@ -666,6 +724,7 @@ def findCampus(name, _status=None):
     typePrefix = {"node": "N", "way": "W", "relation": "R"}.get(osmType)
 
     gdf = None
+    boundaryErr = None
     try:
         throttleNominatim()
         if typePrefix and osmId:
@@ -673,15 +732,36 @@ def findCampus(name, _status=None):
         else:
             gdf = ox.geocode_to_gdf(hitName)
     except Exception as e:
-        if "429" in str(e):
+        boundaryErr = e
+
+    if boundaryErr is not None or gdf is None or gdf.empty or gdf.iloc[0].geometry.geom_type not in ("Polygon", "MultiPolygon"):
+        # the precise boundary lookup failed or came back unusable -- rather
+        # than a hard failure, fall back to the bounding box the search step
+        # already gave us for free (Nominatim includes one on every result,
+        # no extra request needed). It's a rectangle, not the campus's real
+        # outline, so it's a genuine downgrade -- but a slightly-imprecise
+        # working map beats no map, especially when the reason we're here is
+        # that a second network request just got rate-limited.
+        bbox = top_hit.get("boundingbox")
+        if bbox and len(bbox) == 4:
+            try:
+                south, north, west, east = (float(v) for v in bbox)
+                g = shapelyBox(west, south, east, north)
+                if _status is not None:
+                    _status.write(f"Using an approximate boundary for {hitName} -- the precise outline "
+                                   f"was temporarily unavailable.")
+                return hitName, g.wkt
+            except Exception:
+                pass
+
+        if boundaryErr is not None and "429" in str(boundaryErr):
             raise ValueError(
                 "OpenStreetMap's free search service is rate-limiting requests right now "
                 "(HTTP 429), even after retrying. It usually clears on its own within a "
                 "minute or two -- please try again shortly."
             )
-        raise ValueError(f'Found **"{hitName}"** but could not get its boundary.\n\nError: `{e}`')
-
-    if gdf.empty or gdf.iloc[0].geometry.geom_type not in ("Polygon", "MultiPolygon"):
+        if boundaryErr is not None:
+            raise ValueError(f'Found **"{hitName}"** but could not get its boundary.\n\nError: `{boundaryErr}`')
         raise ValueError(
             f'**"{hitName}"** is in OSM but only as a point, not a boundary polygon.\n\n'
             f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
