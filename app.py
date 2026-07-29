@@ -1069,7 +1069,7 @@ with st.sidebar:
             if matches:
                 for m in matches:
                     kind = allNames[m]
-                    icon = "🏢" if kind == "building" else "🛣️"
+                    icon = ""
                     if st.button(f"{icon} {m}", key=f"quick_pick_{kind}_{m}", use_container_width=True):
                         if kind == "building":
                             st.session_state["building_select"] = m
@@ -1214,4 +1214,4 @@ if focusName and focusLoc:
     nearby = nearbyLocations(focusLoc, focusName, st.session_state.get("namedLocations", {}))
     if nearby:
         chips = " · ".join(f"{n} ({int(round(d))}m)" for n, d in nearby)
-        st.caption(f"📍 Near **{focusName}**: {chips}")
+        st.caption(f"Near **{focusName}**: {chips}")
