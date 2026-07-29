@@ -169,22 +169,26 @@ def queryNominatim(q, limit=5, _status=None):
         "polygon_geojson": 1,
     }
 
-    # A single retry after a fixed 3s wasn't enough -- on shared cloud hosting,
-    # Nominatim's "1 request/sec" limit is enforced per source IP, and other
-    # apps/tenants on the same host can burn that budget before we even make
-    # our first request. The fix isn't a longer fixed wait, it's actually
-    # retrying several times with real backoff (and honoring the Retry-After
-    # header when the server sends one) instead of giving up almost instantly.
-    maxAttempts = 5
-    backoffs = [2, 4, 8, 15]  # seconds, used when the server gives no Retry-After
+    # NOTE: this used to retry 5 times with backoff (~40s worst case) before
+    # giving up. If what we're actually hitting is a STANDING block on this
+    # host's shared IP (a real, documented issue -- Nominatim has been known
+    # to blanket-throttle Streamlit Community Cloud's egress IPs specifically,
+    # because so much hobby traffic hits it from there without following
+    # usage policy) then no amount of retrying fixes that, and 40s of
+    # retrying before ever trying the fallback is just wasted time. Fail fast
+    # instead, and let findCampus() move on to a genuinely different service.
+    maxAttempts = 2
+    backoffs = [2, 5]
+    lastStatus = None
+    lastBody = None
 
     for attempt in range(maxAttempts):
         throttleNominatim()
         try:
             r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
             if attempt == maxAttempts - 1:
-                raise
+                raise ValueError(f"Could not reach OpenStreetMap's search service: `{e}`")
             time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
             continue
 
@@ -192,6 +196,8 @@ def queryNominatim(q, limit=5, _status=None):
             r.raise_for_status()
             return r.json()
 
+        lastStatus = r.status_code
+        lastBody = (r.text or "")[:300]
         if attempt == maxAttempts - 1:
             break
 
@@ -200,18 +206,17 @@ def queryNominatim(q, limit=5, _status=None):
             wait = float(retryAfter) if retryAfter is not None else backoffs[min(attempt, len(backoffs) - 1)]
         except ValueError:
             wait = backoffs[min(attempt, len(backoffs) - 1)]
-        wait = min(wait, 20)  # don't let a server-suggested wait stall the app forever
+        wait = min(wait, 10)
 
         if _status is not None:
-            _status.write(f"OpenStreetMap is rate-limiting requests -- retrying in {int(wait)}s "
-                           f"(attempt {attempt + 1}/{maxAttempts})...")
+            _status.write(f"OpenStreetMap returned HTTP 429 -- retrying in {int(wait)}s...")
         time.sleep(wait)
 
+    # Show the actual evidence instead of a canned guess, so this is
+    # verifiable instead of taking my word for it.
     raise ValueError(
-        "OpenStreetMap's free search service is rate-limiting requests right now "
-        "(HTTP 429), even after several retries. This is common on shared cloud "
-        "hosting where many apps share the same IP address. It usually clears on "
-        "its own within a minute or two -- please try again shortly."
+        f"OpenStreetMap's search returned **HTTP {lastStatus}** on every attempt just now.\n\n"
+        f"Raw response: `{lastBody or '(empty)'}`"
     )
 
 
@@ -754,14 +759,12 @@ def findCampus(name, _status=None):
             except Exception:
                 pass
 
-        if boundaryErr is not None and "429" in str(boundaryErr):
-            raise ValueError(
-                "OpenStreetMap's free search service is rate-limiting requests right now "
-                "(HTTP 429), even after retrying. It usually clears on its own within a "
-                "minute or two -- please try again shortly."
-            )
         if boundaryErr is not None:
-            raise ValueError(f'Found **"{hitName}"** but could not get its boundary.\n\nError: `{boundaryErr}`')
+            raise ValueError(
+                f'Found **"{hitName}"** but could not get its precise boundary, and no '
+                f'fallback bounding box was available either.\n\n'
+                f'Raw error: `{boundaryErr}`'
+            )
         raise ValueError(
             f'**"{hitName}"** is in OSM but only as a point, not a boundary polygon.\n\n'
             f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
