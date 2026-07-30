@@ -3,6 +3,8 @@ import streamlit as st
 st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
+    page_title="CampusWay",
+    page_icon="🧭",
 )
 
 import time
@@ -56,17 +58,17 @@ def styleFor(color, fill, opacity, weight, dashed=False):
     return lambda feat: s
 
 campusStyles = {
-    "buildings":  styleFor("#1f77b4", "#1f77b4", 0.45, 1.0),
-    "walkways":   styleFor("#2ca02c", "#2ca02c", 0.0,  2.5, dashed=True),
-    "roads":      styleFor("#7f7f7f", "#7f7f7f", 0.0,  1.5),
-    "facilities": styleFor("#d62728", "#d62728", 0.7,  1.5),
+    "buildings":  styleFor("#3A6EA5", "#3A6EA5", 0.45, 1.0),
+    "walkways":   styleFor("#1F6F54", "#1F6F54", 0.0,  2.5, dashed=True),
+    "roads":      styleFor("#8C8577", "#8C8577", 0.0,  1.5),
+    "facilities": styleFor("#C0392B", "#C0392B", 0.7,  1.5),
 }
 
 LAYER_COLORS = {
-    "buildings":  "#1f77b4",
-    "walkways":   "#2ca02c",
-    "roads":      "#7f7f7f",
-    "facilities": "#d62728",
+    "buildings":  "#3A6EA5",
+    "walkways":   "#1F6F54",
+    "roads":      "#8C8577",
+    "facilities": "#C0392B",
 }
 
 req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
@@ -864,10 +866,12 @@ def addBranding(m):
     branding_html = """
     {% macro html(this, kwargs) %}
     <div style="position: fixed; bottom: 10px; right: 10px; z-index: 9999;
-                background: white; padding: 8px 12px; border-radius: 4px;
-                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px;
-                font-family: sans-serif; line-height: 1.4; color: #333;">
-        CampusWay
+                background: #16233B; padding: 6px 12px; border-radius: 3px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.35); font-size: 12px;
+                font-family: -apple-system, sans-serif; font-weight: 700;
+                text-transform: uppercase; letter-spacing: 0.06em;
+                border-left: 3px solid #E8590C; color: #F0F1EA;">
+        Campus<span style="color:#E8590C;">Way</span>
     </div>
     {% endmacro %}
     """
@@ -956,9 +960,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         legend_html = f"""
         {{% macro html(this, kwargs) %}}
         <div style="position: fixed; bottom: 30px; left: 10px; z-index: 9999;
-                    background: white; padding: 8px 12px; border-radius: 4px;
-                    box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px;
-                    font-family: sans-serif; line-height: 1.4;">
+                    background: #FFFFFF; padding: 8px 12px; border-radius: 3px;
+                    box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 12.5px;
+                    font-family: -apple-system, sans-serif; line-height: 1.5;
+                    border-top: 3px solid #16233B;">
             {rows}
         </div>
         {{% endmacro %}}
@@ -976,10 +981,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         folium.CircleMarker(
             location=[flat, flon],
             radius=16,
-            color="#ff6600",
+            color="#E8590C",
             weight=3,
             fill=True,
-            fill_color="#ff6600",
+            fill_color="#E8590C",
             fill_opacity=0.15,
             tooltip=folium.Tooltip(focusName),
         ).add_to(m)
@@ -993,7 +998,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
                 data=focusRoadGeo,
                 name="__highlight__",
                 style_function=lambda feat: {
-                    "color": "#ff6600",
+                    "color": "#E8590C",
                     "weight": 6,
                     "opacity": 0.9,
                 },
@@ -1003,6 +1008,131 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     return m
+
+
+# ── visual identity ──────────────────────────────────────────────────────────
+# Grounded in campus/trail wayfinding signage rather than a generic dashboard
+# look: a dark "signage panel" sidebar, a condensed display face reminiscent
+# of route/highway lettering, and one confident accent color used the way a
+# trail blaze or route marker uses it -- to say "this way," not to decorate.
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap');
+
+:root {
+    --cw-ink: #16233B;
+    --cw-ink-soft: #223350;
+    --cw-paper: #F0F1EA;
+    --cw-line: #D9DBD0;
+    --cw-accent: #E8590C;
+    --cw-accent-hover: #C94B08;
+    --cw-muted: #5B6472;
+    --cw-text: #1B1F27;
+}
+
+html, body, .stApp { background: var(--cw-paper) !important; }
+.stApp, .stApp p, .stApp span, .stApp li, .stApp div {
+    font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+    color: var(--cw-text);
+}
+
+h1, h2, h3, h4 {
+    font-family: 'Barlow Condensed', sans-serif !important;
+    font-weight: 700 !important;
+    color: var(--cw-ink) !important;
+}
+
+/* sidebar reads as a signage panel: dark, high-contrast, uppercase labels */
+[data-testid="stSidebar"] { background: var(--cw-ink) !important; }
+[data-testid="stSidebar"] * { color: #EDEFEA; }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+    color: #FFFFFF !important;
+    text-transform: uppercase;
+    font-size: 1.05rem !important;
+    letter-spacing: 0.09em;
+    border-left: 4px solid var(--cw-accent);
+    padding-left: 0.55rem;
+    margin: 1.1rem 0 0.6rem 0 !important;
+}
+[data-testid="stSidebar"] hr { border-color: var(--cw-ink-soft); }
+[data-testid="stSidebar"] [data-testid="stExpander"] {
+    border-color: var(--cw-ink-soft) !important;
+    border-radius: 3px;
+}
+
+/* inputs: sharp corners, monospace, feels like a data/route field */
+[data-testid="stTextInput"] input {
+    border-radius: 3px !important;
+    font-family: 'IBM Plex Mono', monospace;
+}
+[data-testid="stSidebar"] [data-testid="stTextInput"] input {
+    background: #1F2E4A;
+    border: 1px solid var(--cw-ink-soft);
+    color: #F5F6F2 !important;
+}
+[data-testid="stSidebar"] [data-testid="stTextInput"] input::placeholder { color: #8891A3; }
+
+/* buttons: bold uppercase signage tabs, not rounded pills */
+.stButton button {
+    border-radius: 3px !important;
+    font-family: 'Barlow Condensed', sans-serif !important;
+    font-weight: 700 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.stButton button[kind="primary"] {
+    background: var(--cw-accent) !important;
+    border-color: var(--cw-accent) !important;
+    color: #fff !important;
+}
+.stButton button[kind="primary"]:hover {
+    background: var(--cw-accent-hover) !important;
+    border-color: var(--cw-accent-hover) !important;
+}
+[data-testid="stSidebar"] .stButton button:not([kind="primary"]) {
+    background: transparent !important;
+    border-color: var(--cw-ink-soft) !important;
+    color: #EDEFEA !important;
+}
+
+/* captions / small text -- utility mono, like a data readout on a sign */
+[data-testid="stCaptionContainer"], .stCaption, small { font-family: 'IBM Plex Mono', monospace !important; }
+
+/* keep focus genuinely visible -- accessibility isn't optional */
+button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--cw-accent) !important;
+    outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+        letter-spacing: 0.04em;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div style="display:flex; align-items:center; gap:0.85rem;
+            padding: 0.4rem 0 1.1rem 0; border-bottom: 3px solid var(--cw-ink);
+            margin-bottom: 1.1rem;">
+    <div style="width:44px; height:44px; flex-shrink:0; background: var(--cw-ink);
+                border-radius:6px; border: 2px solid var(--cw-accent);
+                display:flex; align-items:center; justify-content:center;">
+        <span style="font-size:1.35rem; line-height:1;">🧭</span>
+    </div>
+    <div>
+        <div style="font-family:'Barlow Condensed', sans-serif; font-weight:800;
+                    font-size:1.85rem; line-height:1; color: var(--cw-ink);">
+            CAMPUS<span style="color: var(--cw-accent);">WAY</span>
+        </div>
+        <div style="font-family:'IBM Plex Mono', monospace; font-size:0.76rem;
+                    color: var(--cw-muted); letter-spacing:0.02em; margin-top:3px;">
+            Wayfinding for any campus, anywhere
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
@@ -1069,7 +1199,7 @@ with st.sidebar:
             if matches:
                 for m in matches:
                     kind = allNames[m]
-                    icon = ""
+                    icon = "🏢" if kind == "building" else "🛣️"
                     if st.button(f"{icon} {m}", key=f"quick_pick_{kind}_{m}", use_container_width=True):
                         if kind == "building":
                             st.session_state["building_select"] = m
@@ -1214,4 +1344,4 @@ if focusName and focusLoc:
     nearby = nearbyLocations(focusLoc, focusName, st.session_state.get("namedLocations", {}))
     if nearby:
         chips = " · ".join(f"{n} ({int(round(d))}m)" for n, d in nearby)
-        st.caption(f"Near **{focusName}**: {chips}")
+        st.caption(f"📍 Near **{focusName}**: {chips}")
