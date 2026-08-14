@@ -4,7 +4,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     page_title="CampusWay",
-    page_icon="🧭",
+    page_icon="📍",
 )
 
 import time
@@ -75,11 +75,46 @@ req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
 RATE_LIMIT_GAP = 1.5
 
 
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api",       # osmnx's default -- frequently overloaded
+    "https://overpass.kumi.systems/api", # independent mirror, different infra/load
+]
+
+
 @st.cache_resource
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
+    # osmnx's default is 180s (3 minutes) before it gives up on a slow/overloaded
+    # Overpass server -- that's a long silent wait for a user staring at a
+    # spinner. Cutting it down means we find out something's wrong sooner and
+    # can fall back to a different Overpass mirror instead of just waiting.
+    ox.settings.requests_timeout = 75
+    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
+
+
+def fetchFromOverpass(fetchFn, *args):
+    """Runs an osmnx fetch, and if the default Overpass endpoint fails or times
+    out, retries against an independent mirror before giving up. The public
+    Overpass instance is a shared, free, frequently-overloaded resource --
+    treating one failure as "this campus has no data" (which the code used to
+    do, silently) is simply wrong. This surfaces the real failure instead."""
+    lastErr = None
+    for mirror in OVERPASS_MIRRORS:
+        ox.settings.overpass_url = mirror
+        try:
+            return fetchFn(*args)
+        except Exception as e:
+            lastErr = e
+            continue
+    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
+    raise RuntimeError(
+        f"OpenStreetMap's Overpass data service didn't respond after trying "
+        f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
+        f"it does get overloaded, especially for large campuses -- it's not a "
+        f"sign that this campus lacks data. Raw error: {lastErr}"
+    )
 
 
 def throttleNominatim():
@@ -537,63 +572,67 @@ def fetchRoadsAndWalkways(polygon_wkt):
     # suite, so this is a supported pattern, not a workaround.
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
-    try:
-        gdf = ox.features_from_polygon(poly, tags={"highway": WALKWAY_VALUES + ROAD_VALUES})
-        if gdf is None or gdf.empty or "highway" not in gdf.columns:
-            return None, None, {}, {}
-        gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-        gdf = _simplify(gdf)
 
-        walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
-        roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
-
-        walkways = addLabelAndTrim(walkways, "walkways")
-        roads = addLabelAndTrim(roads, "roads")
-        walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
-        roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
-        walkGeo = _roundGeoJson(walkGeo)
-        roadGeo = _roundGeoJson(roadGeo)
-
-        # named-road index built directly from the SAME GeoJSON that gets
-        # rendered/tooltipped on the map (not a separate pre-trim pass over the
-        # raw dataframe) -- that guarantees every road the map draws is
-        # guaranteed to be consistent with what's searchable. Names are
-        # propagated across touching unnamed segments first (see
-        # _propagateRoadNames) so a road split into many partially-tagged OSM
-        # ways is treated -- and highlighted -- as the single connected road
-        # it actually is, not just whichever fragment happened to carry the tag.
-        allFeatures = []
-        for geo in (roadGeo, walkGeo):
-            if geo:
-                allFeatures.extend(geo.get("features", []))
-
-        effectiveNames = _propagateRoadNames(allFeatures)
-
-        namedRoads = {}
-        namedRoadGeo = {}
-        for i, feat in enumerate(allFeatures):
-            name = effectiveNames.get(i)
-            if not name:
-                continue
-
-            b = _geomBounds(feat.get("geometry"))
-            if b:
-                minx, miny, maxx, maxy = b
-                namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
-
-            if name not in namedRoadGeo:
-                namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
-            else:
-                namedRoadGeo[name]["features"].append(feat)
-
-        # done building the search index off HasName/Label -- now drop every
-        # property except Label from what actually gets shipped to render
-        roadGeo = _stripUnusedProps(roadGeo)
-        walkGeo = _stripUnusedProps(walkGeo)
-
-        return roadGeo, walkGeo, namedRoads, namedRoadGeo
-    except Exception:
+    # NOTE: deliberately no blanket try/except swallowing everything here
+    # anymore. It used to catch every exception -- including a genuine
+    # Overpass timeout on an overloaded public server -- and quietly return
+    # empty data, which showed up to the user as the misleading "OSM has no
+    # data for this campus" even though the real problem was the network
+    # request failing. Real failures now propagate with their real message.
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES})
+    if gdf is None or gdf.empty or "highway" not in gdf.columns:
         return None, None, {}, {}
+    gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+    gdf = _simplify(gdf)
+
+    walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
+    roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
+
+    walkways = addLabelAndTrim(walkways, "walkways")
+    roads = addLabelAndTrim(roads, "roads")
+    walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
+    roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
+    walkGeo = _roundGeoJson(walkGeo)
+    roadGeo = _roundGeoJson(roadGeo)
+
+    # named-road index built directly from the SAME GeoJSON that gets
+    # rendered/tooltipped on the map (not a separate pre-trim pass over the
+    # raw dataframe) -- that guarantees every road the map draws is
+    # guaranteed to be consistent with what's searchable. Names are
+    # propagated across touching unnamed segments first (see
+    # _propagateRoadNames) so a road split into many partially-tagged OSM
+    # ways is treated -- and highlighted -- as the single connected road
+    # it actually is, not just whichever fragment happened to carry the tag.
+    allFeatures = []
+    for geo in (roadGeo, walkGeo):
+        if geo:
+            allFeatures.extend(geo.get("features", []))
+
+    effectiveNames = _propagateRoadNames(allFeatures)
+
+    namedRoads = {}
+    namedRoadGeo = {}
+    for i, feat in enumerate(allFeatures):
+        name = effectiveNames.get(i)
+        if not name:
+            continue
+
+        b = _geomBounds(feat.get("geometry"))
+        if b:
+            minx, miny, maxx, maxy = b
+            namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
+
+        if name not in namedRoadGeo:
+            namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
+        else:
+            namedRoadGeo[name]["features"].append(feat)
+
+    # done building the search index off HasName/Label -- now drop every
+    # property except Label from what actually gets shipped to render
+    roadGeo = _stripUnusedProps(roadGeo)
+    walkGeo = _stripUnusedProps(walkGeo)
+
+    return roadGeo, walkGeo, namedRoads, namedRoadGeo
 fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="24h")(fetchRoadsAndWalkways)
 
 
@@ -604,29 +643,27 @@ def fetchBuildingsAndFacilities(polygon_wkt):
     # (stripDuplicateBuildings) already handles exactly that overlap correctly.
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
-    try:
-        gdf = ox.features_from_polygon(poly, tags={
-            "building": True,
-            "amenity": FACILITY_AMENITY_VALUES,
-            "leisure": FACILITY_LEISURE_VALUES,
-        })
-        if gdf is None or gdf.empty:
-            return None, None
-        gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-        gdf = _simplify(gdf)
 
-        has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
-        has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
-        has_leisure = gdf["leisure"].isin(FACILITY_LEISURE_VALUES) if "leisure" in gdf.columns else pd.Series(False, index=gdf.index)
-
-        buildings = gdf[has_building].copy()
-        facilities = gdf[has_amenity | has_leisure].copy()
-
-        buildings = addLabelAndTrim(buildings, "buildings")
-        facilities = addLabelAndTrim(facilities, "facilities")
-        return buildings, facilities
-    except Exception:
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {
+        "building": True,
+        "amenity": FACILITY_AMENITY_VALUES,
+        "leisure": FACILITY_LEISURE_VALUES,
+    })
+    if gdf is None or gdf.empty:
         return None, None
+    gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+    gdf = _simplify(gdf)
+
+    has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
+    has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
+    has_leisure = gdf["leisure"].isin(FACILITY_LEISURE_VALUES) if "leisure" in gdf.columns else pd.Series(False, index=gdf.index)
+
+    buildings = gdf[has_building].copy()
+    facilities = gdf[has_amenity | has_leisure].copy()
+
+    buildings = addLabelAndTrim(buildings, "buildings")
+    facilities = addLabelAndTrim(facilities, "facilities")
+    return buildings, facilities
 fetchBuildingsAndFacilities = st.cache_data(show_spinner=False, ttl="24h")(fetchBuildingsAndFacilities)
 
 
@@ -801,14 +838,24 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     # re-fetch. Now everything is kept, and which layers are actually drawn is
     # decided fresh at render time from the live checkbox state.
     status.update(label="Fetching roads and pedestrian paths...")
-    roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+    try:
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+    except Exception as e:
+        raise ValueError(
+            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
+        )
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
     status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                  f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
     status.update(label="Fetching buildings and facilities...")
-    bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+    try:
+        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+    except Exception as e:
+        raise ValueError(
+            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
+        )
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
     layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
@@ -1042,9 +1089,13 @@ h1, h2, h3, h4 {
     color: var(--cw-ink) !important;
 }
 
-/* sidebar reads as a signage panel: dark, high-contrast, uppercase labels */
+/* sidebar reads as a signage panel: dark, high-contrast, uppercase labels.
+   !important here is load-bearing, not decoration: Streamlit's own default
+   label/checkbox text color is tuned for a LIGHT background and otherwise
+   wins the cascade over a plain color rule, leaving text on this dark panel
+   almost invisible -- which is exactly the bug this fixes. */
 [data-testid="stSidebar"] { background: var(--cw-ink) !important; }
-[data-testid="stSidebar"] * { color: #EDEFEA; }
+[data-testid="stSidebar"] * { color: #EDEFEA !important; }
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
     color: #FFFFFF !important;
     text-transform: uppercase;
@@ -1059,6 +1110,7 @@ h1, h2, h3, h4 {
     border-color: var(--cw-ink-soft) !important;
     border-radius: 3px;
 }
+[data-testid="stSidebar"] svg { fill: #EDEFEA !important; }
 
 /* inputs: sharp corners, monospace, feels like a data/route field */
 [data-testid="stTextInput"] input {
@@ -1066,11 +1118,11 @@ h1, h2, h3, h4 {
     font-family: 'IBM Plex Mono', monospace;
 }
 [data-testid="stSidebar"] [data-testid="stTextInput"] input {
-    background: #1F2E4A;
-    border: 1px solid var(--cw-ink-soft);
+    background: #1F2E4A !important;
+    border: 1px solid var(--cw-ink-soft) !important;
     color: #F5F6F2 !important;
 }
-[data-testid="stSidebar"] [data-testid="stTextInput"] input::placeholder { color: #8891A3; }
+[data-testid="stSidebar"] [data-testid="stTextInput"] input::placeholder { color: #A8B0BE !important; }
 
 /* buttons: bold uppercase signage tabs, not rounded pills */
 .stButton button {
@@ -1287,7 +1339,7 @@ if "campusData" not in st.session_state:
                 st.session_state["namedRoadGeo"] = namedRoadGeo
                 status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
             except ValueError as e:
-                status.update(label="No OSM data found", state="error")
+                status.update(label="Couldn't build the map", state="error")
                 err = ("warning", str(e))
             except Exception as e:
                 status.update(label="Map build failed", state="error")
