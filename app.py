@@ -12,8 +12,6 @@ import html
 import re
 import requests
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-import threading
 import pandas as pd
 import geopandas as gpd
 import folium
@@ -96,37 +94,21 @@ def initOsmnx():
     return True
 
 
-_overpassLock = threading.Lock()
-
-
 def fetchFromOverpass(fetchFn, *args):
     """Runs an osmnx fetch, and if the default Overpass endpoint fails or times
     out, retries against an independent mirror before giving up. The public
     Overpass instance is a shared, free, frequently-overloaded resource --
     treating one failure as "this campus has no data" (which the code used to
-    do, silently) is simply wrong. This surfaces the real failure instead.
-
-    The roads/walkways and buildings/facilities fetches now run concurrently
-    (see prepareCampusData), and osmnx picks its Overpass server from a
-    single shared global (ox.settings.overpass_url), not a per-call argument.
-    The lock below only wraps the instant of SETTING that global, not the
-    network request itself -- locking the whole request would serialize the
-    two fetches again and defeat the entire point of running them
-    concurrently. Both fetches start on the same default mirror, so in the
-    common case there's no contention at all; the lock just prevents a torn
-    write in the rare case one fetch is mid-retry onto a different mirror
-    while the other is still reading the setting."""
+    do, silently) is simply wrong. This surfaces the real failure instead."""
     lastErr = None
     for mirror in OVERPASS_MIRRORS:
-        with _overpassLock:
-            ox.settings.overpass_url = mirror
+        ox.settings.overpass_url = mirror
         try:
             return fetchFn(*args)
         except Exception as e:
             lastErr = e
             continue
-    with _overpassLock:
-        ox.settings.overpass_url = OVERPASS_MIRRORS[0]
+    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     raise RuntimeError(
         f"OpenStreetMap's Overpass data service didn't respond after trying "
         f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
@@ -854,33 +836,31 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     # re-fetch. Now everything is kept, and which layers are actually drawn is
     # decided fresh at render time from the live checkbox state.
     #
-    # The roads/walkways fetch and the buildings/facilities fetch are
-    # completely independent of each other, so they run concurrently instead
-    # of one after another -- in the worst case (a slow/overloaded Overpass
-    # server) that roughly halves the total wait instead of adding the two
-    # worst cases together.
-    status.update(label="Fetching campus data from OpenStreetMap...")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        roadsFuture = pool.submit(fetchRoadsAndWalkways, polygon_wkt)
-        buildingsFuture = pool.submit(fetchBuildingsAndFacilities, polygon_wkt)
-
-        try:
-            roadGeo, walkGeo, namedRoads, namedRoadGeo = roadsFuture.result()
-        except Exception as e:
-            raise ValueError(
-                f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
-            )
-        try:
-            bldGdf, facGdf = buildingsFuture.result()
-        except Exception as e:
-            raise ValueError(
-                f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
-            )
-
+    # NOTE: these run sequentially, not concurrently. A prior version ran them
+    # in a ThreadPoolExecutor to cut latency, but Streamlit's own caching and
+    # session-context machinery isn't reliably safe to call from a background
+    # thread it doesn't know about -- that's exactly what caused the app to
+    # hang indefinitely instead of ever finishing or timing out. A predictable
+    # ~30-60s beats an unpredictable infinite hang.
+    status.update(label="Fetching roads and pedestrian paths...")
+    try:
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+    except Exception as e:
+        raise ValueError(
+            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
+        )
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
     status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                  f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
+
+    status.update(label="Fetching buildings and facilities...")
+    try:
+        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+    except Exception as e:
+        raise ValueError(
+            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
+        )
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
