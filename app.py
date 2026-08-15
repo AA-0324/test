@@ -12,6 +12,8 @@ import html
 import re
 import requests
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import pandas as pd
 import geopandas as gpd
 import folium
@@ -89,9 +91,12 @@ def initOsmnx():
     # Overpass server -- that's a long silent wait for a user staring at a
     # spinner. Cutting it down means we find out something's wrong sooner and
     # can fall back to a different Overpass mirror instead of just waiting.
-    ox.settings.requests_timeout = 75
+    ox.settings.requests_timeout = 30
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
+
+
+_overpassLock = threading.Lock()
 
 
 def fetchFromOverpass(fetchFn, *args):
@@ -99,16 +104,29 @@ def fetchFromOverpass(fetchFn, *args):
     out, retries against an independent mirror before giving up. The public
     Overpass instance is a shared, free, frequently-overloaded resource --
     treating one failure as "this campus has no data" (which the code used to
-    do, silently) is simply wrong. This surfaces the real failure instead."""
+    do, silently) is simply wrong. This surfaces the real failure instead.
+
+    The roads/walkways and buildings/facilities fetches now run concurrently
+    (see prepareCampusData), and osmnx picks its Overpass server from a
+    single shared global (ox.settings.overpass_url), not a per-call argument.
+    The lock below only wraps the instant of SETTING that global, not the
+    network request itself -- locking the whole request would serialize the
+    two fetches again and defeat the entire point of running them
+    concurrently. Both fetches start on the same default mirror, so in the
+    common case there's no contention at all; the lock just prevents a torn
+    write in the rare case one fetch is mid-retry onto a different mirror
+    while the other is still reading the setting."""
     lastErr = None
     for mirror in OVERPASS_MIRRORS:
-        ox.settings.overpass_url = mirror
+        with _overpassLock:
+            ox.settings.overpass_url = mirror
         try:
             return fetchFn(*args)
         except Exception as e:
             lastErr = e
             continue
-    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
+    with _overpassLock:
+        ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     raise RuntimeError(
         f"OpenStreetMap's Overpass data service didn't respond after trying "
         f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
@@ -826,8 +844,6 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     minx, miny, maxx, maxy = poly.bounds
 
     layerData = {}
-    namedRoads = {}
-    namedRoadGeo = {}
 
     # NOTE: always fetch + store BOTH members of each pair, regardless of which
     # boxes are checked right now. The Overpass query already pulls both
@@ -837,25 +853,35 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     # thrown away, so checking it later had no data to show without a full
     # re-fetch. Now everything is kept, and which layers are actually drawn is
     # decided fresh at render time from the live checkbox state.
-    status.update(label="Fetching roads and pedestrian paths...")
-    try:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
-    except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
+    #
+    # The roads/walkways fetch and the buildings/facilities fetch are
+    # completely independent of each other, so they run concurrently instead
+    # of one after another -- in the worst case (a slow/overloaded Overpass
+    # server) that roughly halves the total wait instead of adding the two
+    # worst cases together.
+    status.update(label="Fetching campus data from OpenStreetMap...")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        roadsFuture = pool.submit(fetchRoadsAndWalkways, polygon_wkt)
+        buildingsFuture = pool.submit(fetchBuildingsAndFacilities, polygon_wkt)
+
+        try:
+            roadGeo, walkGeo, namedRoads, namedRoadGeo = roadsFuture.result()
+        except Exception as e:
+            raise ValueError(
+                f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
+            )
+        try:
+            bldGdf, facGdf = buildingsFuture.result()
+        except Exception as e:
+            raise ValueError(
+                f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
+            )
+
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
     status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                  f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
-    status.update(label="Fetching buildings and facilities...")
-    try:
-        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
-    except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
     layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
@@ -913,11 +939,10 @@ def addBranding(m):
     branding_html = """
     {% macro html(this, kwargs) %}
     <div style="position: fixed; bottom: 10px; right: 10px; z-index: 9999;
-                background: #16233B; padding: 6px 12px; border-radius: 3px;
-                box-shadow: 0 1px 4px rgba(0,0,0,0.35); font-size: 12px;
-                font-family: -apple-system, sans-serif; font-weight: 700;
-                text-transform: uppercase; letter-spacing: 0.06em;
-                border-left: 3px solid #E8590C; color: #F0F1EA;">
+                background: white; padding: 6px 12px; border-radius: 4px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 12px;
+                font-family: -apple-system, sans-serif; font-weight: 600;
+                color: #333;">
         Campus<span style="color:#E8590C;">Way</span>
     </div>
     {% endmacro %}
@@ -1058,138 +1083,50 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
 
 
 # ── visual identity ──────────────────────────────────────────────────────────
-# Grounded in campus/trail wayfinding signage rather than a generic dashboard
-# look: a dark "signage panel" sidebar, a condensed display face reminiscent
-# of route/highway lettering, and one confident accent color used the way a
-# trail blaze or route marker uses it -- to say "this way," not to decorate.
+# Dialed WAY back after repeatedly breaking Streamlit's own internals (icon
+# rendering, label contrast) by overriding its default component styling.
+# Streamlit's default light theme is already clean, accessible, and battle
+# tested -- this only touches things that are genuinely isolated and can't
+# fight with Streamlit's own CSS: a font import, a header banner, and the
+# primary button's color. Nothing here touches the sidebar background,
+# generic text/span/div elements, or any Streamlit internals.
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&family=IBM+Plex+Mono:wght@500&display=swap');
 
 :root {
     --cw-ink: #16233B;
-    --cw-ink-soft: #223350;
-    --cw-paper: #F0F1EA;
-    --cw-line: #D9DBD0;
     --cw-accent: #E8590C;
     --cw-accent-hover: #C94B08;
     --cw-muted: #5B6472;
-    --cw-text: #1B1F27;
 }
 
-html, body, .stApp { background: var(--cw-paper) !important; }
-.stApp {
-    font-family: 'IBM Plex Sans', -apple-system, sans-serif;
-    color: var(--cw-text);
-}
-/* Streamlit renders its UI icons (sidebar collapse arrow, expander chevron,
-   etc.) as literal text like "keyboard_double_arrow_right" that only becomes
-   a glyph because a dedicated icon font is applied to it. Re-declaring
-   font-family on every span/div (an earlier version of this rule did that)
-   silently knocks that icon font off and the raw ligature text shows up
-   instead -- this explicitly protects those elements regardless of what
-   else on the page targets spans. */
-[data-testid="stIconMaterial"], span[class*="material"], i[class*="material"] {
-    font-family: 'Material Symbols Rounded', 'Material Icons' !important;
-}
-
-h1, h2, h3, h4 {
-    font-family: 'Barlow Condensed', sans-serif !important;
-    font-weight: 700 !important;
-    color: var(--cw-ink) !important;
-}
-
-/* sidebar reads as a signage panel: dark, high-contrast, uppercase labels.
-   !important here is load-bearing, not decoration: Streamlit's own default
-   label/checkbox text color is tuned for a LIGHT background and otherwise
-   wins the cascade over a plain color rule, leaving text on this dark panel
-   almost invisible -- which is exactly the bug this fixes. */
-[data-testid="stSidebar"] { background: var(--cw-ink) !important; }
-[data-testid="stSidebar"] * { color: #EDEFEA !important; }
-[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
-    color: #FFFFFF !important;
-    text-transform: uppercase;
-    font-size: 1.05rem !important;
-    letter-spacing: 0.09em;
-    border-left: 4px solid var(--cw-accent);
-    padding-left: 0.55rem;
-    margin: 1.1rem 0 0.6rem 0 !important;
-}
-[data-testid="stSidebar"] hr { border-color: var(--cw-ink-soft); }
-[data-testid="stSidebar"] [data-testid="stExpander"] {
-    border-color: var(--cw-ink-soft) !important;
-    border-radius: 3px;
-}
-[data-testid="stSidebar"] svg { fill: #EDEFEA !important; }
-
-/* inputs: sharp corners, monospace, feels like a data/route field */
-[data-testid="stTextInput"] input {
-    border-radius: 3px !important;
-    font-family: 'IBM Plex Mono', monospace;
-}
-[data-testid="stSidebar"] [data-testid="stTextInput"] input {
-    background: #1F2E4A !important;
-    border: 1px solid var(--cw-ink-soft) !important;
-    color: #F5F6F2 !important;
-}
-[data-testid="stSidebar"] [data-testid="stTextInput"] input::placeholder { color: #A8B0BE !important; }
-
-/* buttons: bold uppercase signage tabs, not rounded pills */
-.stButton button {
-    border-radius: 3px !important;
-    font-family: 'Barlow Condensed', sans-serif !important;
-    font-weight: 700 !important;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-}
 .stButton button[kind="primary"] {
     background: var(--cw-accent) !important;
     border-color: var(--cw-accent) !important;
-    color: #fff !important;
 }
 .stButton button[kind="primary"]:hover {
     background: var(--cw-accent-hover) !important;
     border-color: var(--cw-accent-hover) !important;
-}
-[data-testid="stSidebar"] .stButton button:not([kind="primary"]) {
-    background: transparent !important;
-    border-color: var(--cw-ink-soft) !important;
-    color: #EDEFEA !important;
-}
-
-/* captions / small text -- utility mono, like a data readout on a sign */
-[data-testid="stCaptionContainer"], .stCaption, small { font-family: 'IBM Plex Mono', monospace !important; }
-
-/* keep focus genuinely visible -- accessibility isn't optional */
-button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
-    outline: 2px solid var(--cw-accent) !important;
-    outline-offset: 2px;
-}
-
-@media (max-width: 640px) {
-    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
-        letter-spacing: 0.04em;
-    }
 }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div style="display:flex; align-items:center; gap:0.85rem;
-            padding: 0.4rem 0 1.1rem 0; border-bottom: 3px solid var(--cw-ink);
+            padding: 0.4rem 0 1.1rem 0; border-bottom: 2px solid #E5E5E0;
             margin-bottom: 1.1rem;">
-    <div style="width:44px; height:44px; flex-shrink:0; background: var(--cw-ink);
-                border-radius:6px; border: 2px solid var(--cw-accent);
-                display:flex; align-items:center; justify-content:center;">
-        <span style="font-size:1.35rem; line-height:1;">🧭</span>
+    <div style="width:40px; height:40px; flex-shrink:0; background: var(--cw-ink);
+                border-radius:6px; display:flex; align-items:center; justify-content:center;">
+        <span style="font-size:1.25rem; line-height:1;">🧭</span>
     </div>
     <div>
         <div style="font-family:'Barlow Condensed', sans-serif; font-weight:800;
-                    font-size:1.85rem; line-height:1; color: var(--cw-ink);">
+                    font-size:1.7rem; line-height:1; color: var(--cw-ink);">
             CAMPUS<span style="color: var(--cw-accent);">WAY</span>
         </div>
-        <div style="font-family:'IBM Plex Mono', monospace; font-size:0.76rem;
-                    color: var(--cw-muted); letter-spacing:0.02em; margin-top:3px;">
+        <div style="font-family:'IBM Plex Mono', monospace; font-size:0.75rem;
+                    color: var(--cw-muted); margin-top:3px;">
             Wayfinding for any campus, anywhere
         </div>
     </div>
