@@ -1078,9 +1078,19 @@ st.markdown("""
 }
 
 html, body, .stApp { background: var(--cw-paper) !important; }
-.stApp, .stApp p, .stApp span, .stApp li, .stApp div {
+.stApp {
     font-family: 'IBM Plex Sans', -apple-system, sans-serif;
     color: var(--cw-text);
+}
+/* Streamlit renders its UI icons (sidebar collapse arrow, expander chevron,
+   etc.) as literal text like "keyboard_double_arrow_right" that only becomes
+   a glyph because a dedicated icon font is applied to it. Re-declaring
+   font-family on every span/div (an earlier version of this rule did that)
+   silently knocks that icon font off and the raw ligature text shows up
+   instead -- this explicitly protects those elements regardless of what
+   else on the page targets spans. */
+[data-testid="stIconMaterial"], span[class*="material"], i[class*="material"] {
+    font-family: 'Material Symbols Rounded', 'Material Icons' !important;
 }
 
 h1, h2, h3, h4 {
