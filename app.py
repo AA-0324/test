@@ -22,6 +22,27 @@ import leafmap.foliumap as leafmap
 import osmnx as ox
 
 
+MAX_FEATURES_PER_LAYER = 6000
+
+
+def _capFeatures(gdf, maxRows=MAX_FEATURES_PER_LAYER):
+    # A hard ceiling on how many raw features get processed further. Without
+    # this, an unusually large or imprecise campus boundary can pull back
+    # tens of thousands of individually tagged features from Overpass --
+    # processing all of them (simplifying geometry, labeling, deduping) is
+    # what made the app look frozen for minutes with no feedback at all.
+    # Keeping the largest features by area is a reasonable way to trim for a
+    # wayfinding map: tiny sheds and slivers matter far less than the real
+    # buildings and roads.
+    if gdf is None or len(gdf) <= maxRows:
+        return gdf
+    try:
+        areas = gdf.geometry.area
+        return gdf.loc[areas.sort_values(ascending=False).index[:maxRows]]
+    except Exception:
+        return gdf.iloc[:maxRows]
+
+
 def getIds(gdf):
     if gdf is None or gdf.empty:
         return set()
@@ -60,15 +81,15 @@ def styleFor(color, fill, opacity, weight, dashed=False):
 campusStyles = {
     "buildings":  styleFor("#3A6EA5", "#3A6EA5", 0.45, 1.0),
     "walkways":   styleFor("#1F6F54", "#1F6F54", 0.0,  2.5, dashed=True),
-    "roads":      styleFor("#8C8577", "#8C8577", 0.0,  1.5),
-    "facilities": styleFor("#C0392B", "#C0392B", 0.7,  1.5),
+    "roads":      styleFor("#726B5E", "#726B5E", 0.0,  1.5),
+    "facilities": styleFor("#A02B5C", "#A02B5C", 0.7,  1.5),
 }
 
 LAYER_COLORS = {
     "buildings":  "#3A6EA5",
     "walkways":   "#1F6F54",
-    "roads":      "#8C8577",
-    "facilities": "#C0392B",
+    "roads":      "#726B5E",
+    "facilities": "#A02B5C",
 }
 
 req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
@@ -89,19 +110,22 @@ def initOsmnx():
     # Overpass server -- that's a long silent wait for a user staring at a
     # spinner. Cutting it down means we find out something's wrong sooner and
     # can fall back to a different Overpass mirror instead of just waiting.
-    ox.settings.requests_timeout = 30
+    ox.settings.requests_timeout = 20
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
 
-def fetchFromOverpass(fetchFn, *args):
+def fetchFromOverpass(fetchFn, *args, _status=None):
     """Runs an osmnx fetch, and if the default Overpass endpoint fails or times
     out, retries against an independent mirror before giving up. The public
     Overpass instance is a shared, free, frequently-overloaded resource --
     treating one failure as "this campus has no data" (which the code used to
     do, silently) is simply wrong. This surfaces the real failure instead."""
     lastErr = None
-    for mirror in OVERPASS_MIRRORS:
+    for i, mirror in enumerate(OVERPASS_MIRRORS):
+        if _status is not None:
+            word = "Trying" if i == 0 else "That was slow -- trying a backup"
+            _status.write(f"{word} OpenStreetMap server (up to {ox.settings.requests_timeout}s)...")
         ox.settings.overpass_url = mirror
         try:
             return fetchFn(*args)
@@ -268,6 +292,23 @@ FALLBACK_TAG = {
 USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
 
 
+def _friendlySeries(s):
+    # Vectorized version of _friendly(): operates on a whole column at once
+    # instead of calling a Python function per row. This -- combined with
+    # addLabelAndTrim below -- is the actual fix for the app appearing to
+    # freeze on "Fetching buildings and facilities": a dense campus can have
+    # many thousands of individually tagged building footprints (far more
+    # than road segments), and the old row-by-row .apply() became the real
+    # bottleneck at that scale. Non-string values (NaN, None, or an
+    # occasional OSM multi-value list) are dropped, matching the original.
+    is_str = s.map(lambda v: isinstance(v, str))
+    s = s.where(is_str)
+    s = s.str.strip()
+    useless = s.str.lower().isin(USELESS_CATEGORY_VALUES)
+    s = s.mask(useless | (s == ""))
+    return s.str.replace("_", " ", regex=False).str.replace("-", " ", regex=False).str.title()
+
+
 def _friendly(value):
     if not isinstance(value, str):
         return None
@@ -275,26 +316,6 @@ def _friendly(value):
     if not value or value.lower() in USELESS_CATEGORY_VALUES:
         return None
     return value.replace("_", " ").replace("-", " ").title()
-
-
-def _labelFor(row, layer_key):
-    name = row.get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip(), True
-    tag_col, fallback_word = FALLBACK_TAG[layer_key]
-    val = row.get(tag_col)
-    if layer_key == "facilities" and not _friendly(val):
-        val = row.get("leisure")
-    friendly = _friendly(val)
-    return (friendly if friendly else fallback_word), False
-
-
-def _categoryFor(row, layer_key):
-    tag_col, _ = FALLBACK_TAG[layer_key]
-    val = row.get(tag_col)
-    if layer_key == "facilities" and not _friendly(val):
-        val = row.get("leisure")
-    return _friendly(val)
 
 
 def addLabelAndTrim(gdf, layer_key):
@@ -306,10 +327,23 @@ def addLabelAndTrim(gdf, layer_key):
         keep_cols.append("osmid")
     try:
         gdf = gdf.copy()
-        labels = gdf.apply(lambda row: _labelFor(row, layer_key), axis=1)
-        gdf["Label"]    = labels.apply(lambda t: t[0])
-        gdf["HasName"]  = labels.apply(lambda t: t[1])
-        gdf["Category"] = gdf.apply(lambda row: _categoryFor(row, layer_key), axis=1)
+        tag_col, fallback_word = FALLBACK_TAG[layer_key]
+
+        name_s = gdf["name"] if "name" in gdf.columns else pd.Series([None] * len(gdf), index=gdf.index)
+        name_s = name_s.map(lambda v: v.strip() if isinstance(v, str) else None)
+        has_name = name_s.notna() & (name_s != "")
+
+        primary_col = gdf[tag_col] if tag_col in gdf.columns else pd.Series([None] * len(gdf), index=gdf.index)
+        category = _friendlySeries(primary_col)
+
+        if layer_key == "facilities" and "leisure" in gdf.columns:
+            category = category.fillna(_friendlySeries(gdf["leisure"]))
+
+        label = name_s.where(has_name, category.fillna(fallback_word))
+
+        gdf["Label"] = label
+        gdf["HasName"] = has_name
+        gdf["Category"] = category
         keep_cols += ["Label", "HasName", "Category"]
         return gdf[keep_cols]
     except Exception:
@@ -565,7 +599,7 @@ def _propagateRoadNames(features, maxHops=6):
     return effectiveName
 
 
-def fetchRoadsAndWalkways(polygon_wkt):
+def fetchRoadsAndWalkways(polygon_wkt, _status=None):
     # ONE combined Overpass query for both roads and walkways (both are highway=*
     # tags, just different values) instead of two separate round-trips -- OSMnx
     # documents this union behavior explicitly and it's covered by their own test
@@ -579,11 +613,12 @@ def fetchRoadsAndWalkways(polygon_wkt):
     # empty data, which showed up to the user as the misleading "OSM has no
     # data for this campus" even though the real problem was the network
     # request failing. Real failures now propagate with their real message.
-    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES})
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES}, _status=_status)
     if gdf is None or gdf.empty or "highway" not in gdf.columns:
         return None, None, {}, {}
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
+    gdf = _capFeatures(gdf)
 
     walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
     roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
@@ -636,7 +671,7 @@ def fetchRoadsAndWalkways(polygon_wkt):
 fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="24h")(fetchRoadsAndWalkways)
 
 
-def fetchBuildingsAndFacilities(polygon_wkt):
+def fetchBuildingsAndFacilities(polygon_wkt, _status=None):
     # ONE combined query for buildings + facilities instead of two round-trips.
     # a feature CAN legitimately have both building=yes and amenity=library --
     # that's fine, it lands in both splits below, and the existing dedup step
@@ -648,11 +683,12 @@ def fetchBuildingsAndFacilities(polygon_wkt):
         "building": True,
         "amenity": FACILITY_AMENITY_VALUES,
         "leisure": FACILITY_LEISURE_VALUES,
-    })
+    }, _status=_status)
     if gdf is None or gdf.empty:
         return None, None
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
+    gdf = _capFeatures(gdf)
 
     has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
     has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
@@ -844,7 +880,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     # ~30-60s beats an unpredictable infinite hang.
     status.update(label="Fetching roads and pedestrian paths...")
     try:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt, _status=status)
     except Exception as e:
         raise ValueError(
             f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
@@ -856,7 +892,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     status.update(label="Fetching buildings and facilities...")
     try:
-        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt, _status=status)
     except Exception as e:
         raise ValueError(
             f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
@@ -923,7 +959,7 @@ def addBranding(m):
                 box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 12px;
                 font-family: -apple-system, sans-serif; font-weight: 600;
                 color: #333;">
-        Campus<span style="color:#E8590C;">Way</span>
+        Campus<span style="color:#C54C0A;">Way</span>
     </div>
     {% endmacro %}
     """
@@ -1033,10 +1069,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         folium.CircleMarker(
             location=[flat, flon],
             radius=16,
-            color="#E8590C",
+            color="#C54C0A",
             weight=3,
             fill=True,
-            fill_color="#E8590C",
+            fill_color="#C54C0A",
             fill_opacity=0.15,
             tooltip=folium.Tooltip(focusName),
         ).add_to(m)
@@ -1050,7 +1086,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
                 data=focusRoadGeo,
                 name="__highlight__",
                 style_function=lambda feat: {
-                    "color": "#E8590C",
+                    "color": "#C54C0A",
                     "weight": 6,
                     "opacity": 0.9,
                 },
@@ -1076,8 +1112,8 @@ st.markdown("""
 
 :root {
     --cw-ink: #16233B;
-    --cw-accent: #E8590C;
-    --cw-accent-hover: #C94B08;
+    --cw-accent: #C54C0A;
+    --cw-accent-hover: #A23E08;
     --cw-muted: #5B6472;
 }
 
