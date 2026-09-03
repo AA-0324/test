@@ -768,24 +768,27 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     with ThreadPoolExecutor(max_workers=2) as ex:
         futRoads = ex.submit(_fetchRoads)
         futBlds  = ex.submit(_fetchBuildings)
-        for fut in as_completed([futRoads, futBlds]):
-            if fut is futRoads:
-                try:
-                    roadGeo, walkGeo, namedRoads, namedRoadGeo = fut.result()
-                    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
-                                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
-                except Exception as e:
-                    roadErr = e
-            else:
-                try:
-                    bldGdf, facGdf = fut.result()
-                except Exception as e:
-                    bldErr = e
+        # Collect results WITHOUT touching any Streamlit widget from inside
+        # the thread context -- Streamlit is not thread-safe and calling
+        # status.write() from as_completed() causes a silent hang.
+        # All widget calls happen below, back on the main thread.
+        try:
+            roadGeo, walkGeo, namedRoads, namedRoadGeo = futRoads.result()
+        except Exception as e:
+            roadErr = e
+        try:
+            bldGdf, facGdf = futBlds.result()
+        except Exception as e:
+            bldErr = e
 
     if roadErr:
         raise ValueError(f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{roadErr}")
     if bldErr:
         raise ValueError(f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{bldErr}")
+
+    # Status updates back on the main thread, safe to call now
+    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
+                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
@@ -862,10 +865,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
     # the key parameter is included and the "API key required" watermark is
     # removed. CartoDB.Positron (light_all) is visually identical to what the
     # app used before -- the only change is the key in the URL.
-    m = leafmap.Map(
-        center=[cLat, cLon],
-        zoom=15,
-        tiles=None,          # disable the default tile layer; we add ours below
+    m = folium.Map(
+        location=[cLat, cLon],
+        zoom_start=15,
+        tiles=None,
         prefer_canvas=True,
         control_scale=True,
     )
