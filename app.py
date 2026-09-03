@@ -659,19 +659,6 @@ def findCampus(name, _status=None):
     if not results:
         raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
 
-    # ── DEBUG: show raw Nominatim results so we can see exactly why
-    # the classifier is or isn't matching ──────────────────────────
-    if _status is not None:
-        _status.write(f"**Debug — raw results ({len(results)}):**")
-        for i, r in enumerate(results):
-            _status.write(
-                f"  [{i}] class={r.get('class')!r} category={r.get('category')!r} "
-                f"type={r.get('type')!r} osm_type={r.get('osm_type')!r} "
-                f"passes={looksLikeCampus(r)} | "
-                f"{(r.get('display_name') or '')[:80]}"
-            )
-    # ── END DEBUG ─────────────────────────────────────────────────
-
     results.sort(key=lambda r: not looksLikeCampus(r))
     edu_hits = [r for r in results if looksLikeCampus(r)]
 
