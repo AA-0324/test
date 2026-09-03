@@ -114,12 +114,11 @@ def initOsmnx():
     return True
 
 
-def fetchFromOverpass(fetchFn, *args, _status=None):
+def fetchFromOverpass(fetchFn, *args):
+    # No _status param: called from inside st.cache_data functions where
+    # writing to Streamlit widgets is forbidden and causes the cached-replay crash.
     lastErr = None
-    for i, mirror in enumerate(OVERPASS_MIRRORS):
-        if _status is not None:
-            word = "Trying" if i == 0 else "That was slow -- trying a backup"
-            _status.write(f"{word} OpenStreetMap server (up to {ox.settings.requests_timeout}s)...")
+    for mirror in OVERPASS_MIRRORS:
         ox.settings.overpass_url = mirror
         try:
             return fetchFn(*args)
@@ -233,7 +232,7 @@ def queryPhoton(q, limit=5):
     return out
 
 
-def queryNominatim(q, limit=5, _status=None):
+def queryNominatim(q, limit=5):
     p = {
         "q": q,
         "format": "jsonv2",
@@ -272,8 +271,6 @@ def queryNominatim(q, limit=5, _status=None):
             wait = backoffs[min(attempt, len(backoffs) - 1)]
         wait = min(wait, 10)
 
-        if _status is not None:
-            _status.write(f"OpenStreetMap returned HTTP 429 -- retrying in {int(wait)}s...")
         time.sleep(wait)
 
     raise ValueError(
@@ -534,11 +531,11 @@ def _propagateRoadNames(features, maxHops=6):
     return effectiveName
 
 
-def fetchRoadsAndWalkways(polygon_wkt, _status=None):
+def fetchRoadsAndWalkways(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
-    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES}, _status=_status)
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES})
     if gdf is None or gdf.empty or "highway" not in gdf.columns:
         return None, None, {}, {}
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
@@ -586,7 +583,7 @@ def fetchRoadsAndWalkways(polygon_wkt, _status=None):
 fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="24h")(fetchRoadsAndWalkways)
 
 
-def fetchBuildingsAndFacilities(polygon_wkt, _status=None):
+def fetchBuildingsAndFacilities(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
@@ -594,7 +591,7 @@ def fetchBuildingsAndFacilities(polygon_wkt, _status=None):
         "building": True,
         "amenity": FACILITY_AMENITY_VALUES,
         "leisure": FACILITY_LEISURE_VALUES,
-    }, _status=_status)
+    })
     if gdf is None or gdf.empty:
         return None, None
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
@@ -645,12 +642,10 @@ def _alternateNameGuess(name):
     return f"{rest.strip()} {kind.title()}"
 
 
-def findCampus(name, _status=None):
+def findCampus(name):
     try:
-        results = queryNominatim(name, _status=_status)
+        results = queryNominatim(name)
     except ValueError as nomErr:
-        if _status is not None:
-            _status.write("OpenStreetMap search is unavailable -- trying a backup search service...")
         try:
             results = queryPhoton(name)
         except Exception:
@@ -666,7 +661,7 @@ def findCampus(name, _status=None):
         alt = _alternateNameGuess(name)
         if alt:
             try:
-                altResults = queryNominatim(alt, _status=_status)
+                altResults = queryNominatim(alt)
                 altResults.sort(key=lambda r: not looksLikeCampus(r))
                 altEduHits = [r for r in altResults if looksLikeCampus(r)]
                 if altEduHits:
@@ -730,9 +725,6 @@ def findCampus(name, _status=None):
             try:
                 south, north, west, east = (float(v) for v in bbox)
                 g = shapelyBox(west, south, east, north)
-                if _status is not None:
-                    _status.write(f"Using an approximate boundary for {hitName} -- the precise outline "
-                                   f"was temporarily unavailable.")
                 return hitName, g.wkt
             except Exception:
                 pass
@@ -764,7 +756,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     status.update(label="Fetching roads and pedestrian paths...")
     try:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt, _status=status)
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
     except Exception as e:
         raise ValueError(
             f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
@@ -776,7 +768,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     status.update(label="Fetching buildings and facilities...")
     try:
-        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt, _status=status)
+        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
     except Exception as e:
         raise ValueError(
             f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
@@ -1135,7 +1127,7 @@ if "campusData" not in st.session_state:
     err = None
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            campusName, campusPoly = findCampus(searchTerm, _status=status)
+            campusName, campusPoly = findCampus(searchTerm)
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
         except ValueError as e:
