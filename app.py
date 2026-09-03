@@ -4,7 +4,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     page_title="CampusWay",
-    page_icon="🧭",
+    page_icon="🗺️",
 )
 
 import time
@@ -22,7 +22,7 @@ import leafmap.foliumap as leafmap
 import osmnx as ox
 
 
-MAX_FEATURES_PER_LAYER = 6000
+MAX_FEATURES_PER_LAYER = 2500
 
 # ── CARTO basemap tile URL with API key (removes watermark) ──────────────────
 CARTO_KEY = "cb1_2ely_1_56403dce0becb94f8ac75d76"
@@ -109,7 +109,7 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 20
+    ox.settings.requests_timeout = 15
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
@@ -340,7 +340,7 @@ def addLabelAndTrim(gdf, layer_key):
         return gdf
 
 
-SIMPLIFY_TOLERANCE = 0.00005
+SIMPLIFY_TOLERANCE = 0.0001
 
 
 def _simplify(gdf):
@@ -754,25 +754,38 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     layerData = {}
 
-    status.update(label="Fetching roads and pedestrian paths...")
-    try:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
-    except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
-    layerData["roads"] = roadGeo
-    layerData["walkways"] = walkGeo
-    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
-                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
+    status.update(label="Fetching campus data from OpenStreetMap...")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    roadErr = bldErr = None
+    roadGeo = walkGeo = namedRoads = namedRoadGeo = bldGdf = facGdf = None
 
-    status.update(label="Fetching buildings and facilities...")
-    try:
-        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
-    except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
+    def _fetchRoads():
+        return fetchRoadsAndWalkways(polygon_wkt)
+
+    def _fetchBuildings():
+        return fetchBuildingsAndFacilities(polygon_wkt)
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futRoads = ex.submit(_fetchRoads)
+        futBlds  = ex.submit(_fetchBuildings)
+        for fut in as_completed([futRoads, futBlds]):
+            if fut is futRoads:
+                try:
+                    roadGeo, walkGeo, namedRoads, namedRoadGeo = fut.result()
+                    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
+                                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
+                except Exception as e:
+                    roadErr = e
+            else:
+                try:
+                    bldGdf, facGdf = fut.result()
+                except Exception as e:
+                    bldErr = e
+
+    if roadErr:
+        raise ValueError(f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{roadErr}")
+    if bldErr:
+        raise ValueError(f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{bldErr}")
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
