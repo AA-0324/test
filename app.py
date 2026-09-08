@@ -4,7 +4,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     page_title="CampusWay",
-    page_icon="🧭",
+    page_icon="C",
 )
 
 import time
@@ -18,11 +18,10 @@ import folium
 from branca.element import MacroElement, Template
 from shapely.geometry import shape, box as shapelyBox
 from folium import plugins as folium_plugins
-import leafmap.foliumap as leafmap
 import osmnx as ox
 
 
-MAX_FEATURES_PER_LAYER = 6000
+MAX_FEATURES_PER_LAYER = 2500
 
 # ── CARTO basemap tile URL with API key (removes watermark) ──────────────────
 CARTO_KEY = "cb1_2ely_1_56403dce0becb94f8ac75d76"
@@ -109,7 +108,7 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 20
+    ox.settings.requests_timeout = 15
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
@@ -340,7 +339,7 @@ def addLabelAndTrim(gdf, layer_key):
         return gdf
 
 
-SIMPLIFY_TOLERANCE = 0.00005
+SIMPLIFY_TOLERANCE = 0.0001
 
 
 def _simplify(gdf):
@@ -754,31 +753,22 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     layerData = {}
 
-    status.update(label="Fetching roads and pedestrian paths...")
+    status.update(label="Fetching roads and paths...")
     try:
         roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
     except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
+        raise ValueError(f"Couldn't fetch road/path data from OpenStreetMap.\n\n{e}")
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
-    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
-                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
     status.update(label="Fetching buildings and facilities...")
     try:
         bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
     except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
-
+        raise ValueError(f"Couldn't fetch building data from OpenStreetMap.\n\n{e}")
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
     layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
-    status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
-                 f"Facilities: {len(facGdf) if facGdf is not None else 0}")
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     counts = {}
@@ -849,10 +839,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
     # the key parameter is included and the "API key required" watermark is
     # removed. CartoDB.Positron (light_all) is visually identical to what the
     # app used before -- the only change is the key in the URL.
-    m = leafmap.Map(
-        center=[cLat, cLon],
-        zoom=15,
-        tiles=None,          # disable the default tile layer; we add ours below
+    m = folium.Map(
+        location=[cLat, cLon],
+        zoom_start=15,
+        tiles=None,
         prefer_canvas=True,
         control_scale=True,
     )
@@ -961,6 +951,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
 
 # ── visual identity ──────────────────────────────────────────────────────────
 st.markdown("""
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2316233B'/><text x='50%25' y='50%25' dominant-baseline='central' text-anchor='middle' font-family='Arial Black,sans-serif' font-weight='900' font-size='16' fill='%23C54C0A'>CW</text></svg>">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&family=IBM+Plex+Mono:wght@500&display=swap');
 
@@ -1200,7 +1191,8 @@ campusMap = renderCampusMap(
     focusRoadGeo=focusRoadGeo,
 )
 
-campusMap.to_streamlit(height=620)
+import streamlit.components.v1 as components
+components.html(campusMap._repr_html_(), height=680, scrolling=False)
 
 if focusName and focusLoc:
     nearby = nearbyLocations(focusLoc, focusName, st.session_state.get("namedLocations", {}))
