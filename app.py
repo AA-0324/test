@@ -102,6 +102,7 @@ RATE_LIMIT_GAP = 1.5
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api",
     "https://overpass.kumi.systems/api",
+    "https://overpass.private.coffee/api",
 ]
 
 
@@ -109,7 +110,7 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 20
+    ox.settings.requests_timeout = 90
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
@@ -117,20 +118,24 @@ def initOsmnx():
 def fetchFromOverpass(fetchFn, *args):
     # No _status param: called from inside st.cache_data functions where
     # writing to Streamlit widgets is forbidden and causes the cached-replay crash.
+    # Each mirror is tried up to 2 times with a short back-off before moving on.
     lastErr = None
     for mirror in OVERPASS_MIRRORS:
-        ox.settings.overpass_url = mirror
-        try:
-            return fetchFn(*args)
-        except Exception as e:
-            lastErr = e
-            continue
+        for attempt in range(2):
+            ox.settings.overpass_url = mirror
+            try:
+                return fetchFn(*args)
+            except Exception as e:
+                lastErr = e
+                if attempt == 0:
+                    time.sleep(3)   # brief pause before retrying same mirror
+                continue
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     raise RuntimeError(
         f"OpenStreetMap's Overpass data service didn't respond after trying "
-        f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
-        f"it does get overloaded, especially for large campuses -- it's not a "
-        f"sign that this campus lacks data. Raw error: {lastErr}"
+        f"{len(OVERPASS_MIRRORS)} server(s) × 2 attempts each. This is a shared "
+        f"free service and it does get overloaded, especially for large campuses "
+        f"-- it's not a sign that this campus lacks data. Raw error: {lastErr}"
     )
 
 
@@ -755,24 +760,24 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData = {}
 
     status.update(label="Fetching roads and pedestrian paths...")
+    roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
     try:
         roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+        status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
+                     f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
     except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
+        status.write(f"⚠️ Road/path data unavailable (Overpass timeout or overload) — "
+                     f"continuing with buildings only. Error: {e}")
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
-    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
-                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
     status.update(label="Fetching buildings and facilities...")
+    bldGdf, facGdf = None, None
     try:
         bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
     except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
+        status.write(f"⚠️ Building data unavailable (Overpass timeout or overload) — "
+                     f"continuing with roads/paths only. Error: {e}")
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
