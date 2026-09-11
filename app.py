@@ -22,7 +22,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-11-02-threadfix"
+BUILD_MARKER = "diag-2026-09-11-03-shutdownfix"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -107,22 +107,35 @@ def runWithDeadline(fn, args, seconds, label):
     Run fn(*args) in a background thread and give up after `seconds`,
     regardless of what fn is actually doing (blocked socket read, DNS
     resolution hang, a dependency ignoring its own timeout, etc).
-    requests' own `timeout=` param only bounds individual socket ops, not
-    the whole call in every failure mode -- this is a true wall-clock cap
-    so the UI can never spin forever. The background thread is a daemon,
-    so if it eventually does return, it's simply discarded.
+
+    IMPORTANT: this deliberately does NOT use ThreadPoolExecutor as a
+    `with` block. `with ThreadPoolExecutor() as pool:` calls
+    pool.shutdown(wait=True) on exit -- which BLOCKS until the background
+    thread actually finishes, even if future.result(timeout=...) already
+    raised. That silently defeated the entire point of a deadline: the
+    caller would still hang for however long the real call took, just
+    with an extra exception swallowed at the end. Calling shutdown(wait=False)
+    explicitly lets the calling thread return immediately once the deadline
+    hits; the orphaned worker thread finishes on its own and its result
+    (or exception) is simply discarded.
     """
     import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, *args)
-        try:
-            return future.result(timeout=seconds)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(
-                f"{label} took longer than {seconds}s and was cancelled. "
-                f"OpenStreetMap's free services can be slow or unreachable "
-                f"depending on network conditions -- try again in a moment."
-            )
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn, *args)
+    try:
+        result = future.result(timeout=seconds)
+        pool.shutdown(wait=False)
+        return result
+    except concurrent.futures.TimeoutError:
+        pool.shutdown(wait=False)  # do NOT wait -- this is the actual fix
+        raise TimeoutError(
+            f"{label} took longer than {seconds}s and was cancelled. "
+            f"OpenStreetMap's free services can be slow or unreachable "
+            f"depending on network conditions -- try again in a moment."
+        )
+    except Exception:
+        pool.shutdown(wait=False)
+        raise
 
 
 OVERPASS_MIRRORS = [
@@ -573,16 +586,13 @@ def fetchRoadsAndWalkways(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
-    # osmnx features_from_polygon does NOT support list values as OR filters.
-    # Passing a list generates a malformed Overpass query that hangs or returns
-    # nothing -- this was the root cause of the infinite spinner. Fetch all
-    # highway features with True and filter locally instead.
-    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": True})
+    # osmnx DOES support list values as OR filters (confirmed against docs) --
+    # scope this to only the highway types we display, rather than True
+    # (which pulls every highway type, including motorways/trunks/etc that
+    # get filtered right back out below -- unnecessarily slow for no benefit).
+    allowed = WALKWAY_VALUES + ROAD_VALUES
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": allowed})
     if gdf is None or gdf.empty or "highway" not in gdf.columns:
-        return None, None, {}, {}
-    allowed = set(WALKWAY_VALUES + ROAD_VALUES)
-    gdf = gdf[gdf["highway"].isin(allowed)]
-    if gdf.empty:
         return None, None, {}, {}
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
@@ -633,12 +643,16 @@ def fetchBuildingsAndFacilities(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
-    # Same as fetchRoadsAndWalkways: pass True for each tag key and filter
-    # locally -- osmnx does not support list values as OR filters in Overpass queries.
+    # osmnx DOES support list values as OR filters (confirmed against docs) --
+    # scope amenity/leisure to only the values we actually display, rather than
+    # True (which pulls down every amenity of any kind -- benches, waste
+    # baskets, vending machines, etc -- across the whole campus and is much
+    # slower for large campuses like MIT for no benefit, since we filter it
+    # right back down below anyway).
     gdf = fetchFromOverpass(ox.features_from_polygon, poly, {
         "building": True,
-        "amenity": True,
-        "leisure": True,
+        "amenity": FACILITY_AMENITY_VALUES,
+        "leisure": FACILITY_LEISURE_VALUES,
     })
     if gdf is None or gdf.empty:
         return None, None
