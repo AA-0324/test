@@ -10,6 +10,7 @@ st.set_page_config(
 import time
 import html
 import re
+import threading
 import requests
 from collections import deque
 import pandas as pd
@@ -21,7 +22,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-11-01"
+BUILD_MARKER = "diag-2026-09-11-02-threadfix"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -164,12 +165,19 @@ def fetchFromOverpass(fetchFn, *args):
     )
 
 
+_nomLastCallTime = [0.0]
+_nomLock = threading.Lock()
+
 def throttleNominatim():
-    t_last = st.session_state.get("nom_last", 0.0)
-    gap = RATE_LIMIT_GAP - (time.monotonic() - t_last)
-    if gap > 0:
-        time.sleep(gap)
-    st.session_state["nom_last"] = time.monotonic()
+    # Plain module-level state, NOT st.session_state: this function is called
+    # from inside a background thread (see runWithDeadline), and st.session_state
+    # requires Streamlit's script-run context which only exists on the main
+    # thread. Using session_state here was silently unreliable across threads.
+    with _nomLock:
+        gap = RATE_LIMIT_GAP - (time.monotonic() - _nomLastCallTime[0])
+        if gap > 0:
+            time.sleep(gap)
+        _nomLastCallTime[0] = time.monotonic()
 
 
 initOsmnx()
