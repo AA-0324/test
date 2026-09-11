@@ -21,6 +21,8 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
+BUILD_MARKER = "diag-2026-09-11-01"
+
 
 MAX_FEATURES_PER_LAYER = 6000
 
@@ -99,6 +101,29 @@ req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
 RATE_LIMIT_GAP = 1.5
 
 
+def runWithDeadline(fn, args, seconds, label):
+    """
+    Run fn(*args) in a background thread and give up after `seconds`,
+    regardless of what fn is actually doing (blocked socket read, DNS
+    resolution hang, a dependency ignoring its own timeout, etc).
+    requests' own `timeout=` param only bounds individual socket ops, not
+    the whole call in every failure mode -- this is a true wall-clock cap
+    so the UI can never spin forever. The background thread is a daemon,
+    so if it eventually does return, it's simply discarded.
+    """
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn, *args)
+        try:
+            return future.result(timeout=seconds)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(
+                f"{label} took longer than {seconds}s and was cancelled. "
+                f"OpenStreetMap's free services can be slow or unreachable "
+                f"depending on network conditions -- try again in a moment."
+            )
+
+
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api",
     "https://overpass.kumi.systems/api",
@@ -110,7 +135,7 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 90
+    ox.settings.requests_timeout = 25
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
@@ -118,24 +143,24 @@ def initOsmnx():
 def fetchFromOverpass(fetchFn, *args):
     # No _status param: called from inside st.cache_data functions where
     # writing to Streamlit widgets is forbidden and causes the cached-replay crash.
-    # Each mirror is tried up to 2 times with a short back-off before moving on.
+    # Try each mirror ONCE -- no retry-with-sleep here. Retrying each mirror
+    # multiple times with long timeouts previously multiplied worst-case wait
+    # to several minutes per call, which is indistinguishable from "stuck" to
+    # a user. The hard deadline in runWithDeadline() is the real safety net.
     lastErr = None
     for mirror in OVERPASS_MIRRORS:
-        for attempt in range(2):
-            ox.settings.overpass_url = mirror
-            try:
-                return fetchFn(*args)
-            except Exception as e:
-                lastErr = e
-                if attempt == 0:
-                    time.sleep(3)   # brief pause before retrying same mirror
-                continue
+        ox.settings.overpass_url = mirror
+        try:
+            return fetchFn(*args)
+        except Exception as e:
+            lastErr = e
+            continue
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     raise RuntimeError(
         f"OpenStreetMap's Overpass data service didn't respond after trying "
-        f"{len(OVERPASS_MIRRORS)} server(s) × 2 attempts each. This is a shared "
-        f"free service and it does get overloaded, especially for large campuses "
-        f"-- it's not a sign that this campus lacks data. Raw error: {lastErr}"
+        f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
+        f"it does get overloaded, especially for large campuses -- it's not a "
+        f"sign that this campus lacks data. Raw error: {lastErr}"
     )
 
 
@@ -748,22 +773,24 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     status.update(label="Fetching roads and pedestrian paths...")
     roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
     try:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = runWithDeadline(
+            fetchRoadsAndWalkways, (polygon_wkt,), 75, "Road/path fetch"
+        )
         status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                      f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
     except Exception as e:
-        status.write(f"⚠️ Road/path data unavailable (Overpass timeout or overload) — "
-                     f"continuing with buildings only. Error: {e}")
+        status.write(f"⚠️ Road/path data unavailable ({e}) — continuing with buildings only.")
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
 
     status.update(label="Fetching buildings and facilities...")
     bldGdf, facGdf = None, None
     try:
-        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+        bldGdf, facGdf = runWithDeadline(
+            fetchBuildingsAndFacilities, (polygon_wkt,), 75, "Building fetch"
+        )
     except Exception as e:
-        status.write(f"⚠️ Building data unavailable (Overpass timeout or overload) — "
-                     f"continuing with roads/paths only. Error: {e}")
+        status.write(f"⚠️ Building data unavailable ({e}) — continuing with roads/paths only.")
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
@@ -1000,6 +1027,31 @@ st.markdown("""
 use_facilities = True
 
 with st.sidebar:
+    st.caption(f"build: {BUILD_MARKER}")
+
+    with st.expander("🔧 Network diagnostic (isolated test)"):
+        st.caption(
+            "This bypasses ALL app logic and makes ONE direct request to "
+            "Nominatim with a 10s timeout. If this hangs or errors, the "
+            "problem is network/deployment-level, not this app's code."
+        )
+        if st.button("Run isolated network test"):
+            diagStart = time.time()
+            try:
+                diagResp = requests.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": "MIT", "format": "jsonv2", "limit": 1},
+                    headers={"User-Agent": "campusway-diagnostic/1.0"},
+                    timeout=10,
+                )
+                diagElapsed = time.time() - diagStart
+                st.success(f"HTTP {diagResp.status_code} in {diagElapsed:.1f}s")
+                st.json(diagResp.json()[:1] if diagResp.ok else diagResp.text[:500])
+            except Exception as e:
+                diagElapsed = time.time() - diagStart
+                st.error(f"FAILED after {diagElapsed:.1f}s: {type(e).__name__}: {e}")
+
+    st.divider()
     st.subheader("Search")
     campusInput = st.text_input(
         "University or college name",
@@ -1118,9 +1170,12 @@ if "campusData" not in st.session_state:
     err = None
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            campusName, campusPoly = findCampus(searchTerm)
+            campusName, campusPoly = runWithDeadline(findCampus, (searchTerm,), 60, "Campus lookup")
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
+        except TimeoutError as e:
+            status.update(label="Timed out", state="error")
+            err = ("error", str(e))
         except ValueError as e:
             status.update(label="Could not find campus", state="error")
             err = ("error", str(e))
