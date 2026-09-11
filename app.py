@@ -540,8 +540,16 @@ def fetchRoadsAndWalkways(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
-    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES})
+    # osmnx features_from_polygon does NOT support list values as OR filters.
+    # Passing a list generates a malformed Overpass query that hangs or returns
+    # nothing -- this was the root cause of the infinite spinner. Fetch all
+    # highway features with True and filter locally instead.
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": True})
     if gdf is None or gdf.empty or "highway" not in gdf.columns:
+        return None, None, {}, {}
+    allowed = set(WALKWAY_VALUES + ROAD_VALUES)
+    gdf = gdf[gdf["highway"].isin(allowed)]
+    if gdf.empty:
         return None, None, {}, {}
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
