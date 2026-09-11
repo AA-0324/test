@@ -600,10 +600,12 @@ def fetchBuildingsAndFacilities(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
+    # Same as fetchRoadsAndWalkways: pass True for each tag key and filter
+    # locally -- osmnx does not support list values as OR filters in Overpass queries.
     gdf = fetchFromOverpass(ox.features_from_polygon, poly, {
         "building": True,
-        "amenity": FACILITY_AMENITY_VALUES,
-        "leisure": FACILITY_LEISURE_VALUES,
+        "amenity": True,
+        "leisure": True,
     })
     if gdf is None or gdf.empty:
         return None, None
@@ -717,46 +719,22 @@ def findCampus(name):
     top_hit = edu_hits[0]
     hitName = top_hit.get("display_name", name)
 
-    osmType = top_hit.get("osm_type")
-    osmId = top_hit.get("osm_id")
-    typePrefix = {"node": "N", "way": "W", "relation": "R"}.get(osmType)
+    # queryNominatim already requests polygon_geojson=1, so if we reach here
+    # it means the hit had no usable polygon in that response. Fall back to
+    # the bounding box Nominatim always provides -- no second network call.
+    bbox = top_hit.get("boundingbox")
+    if bbox and len(bbox) == 4:
+        try:
+            south, north, west, east = (float(v) for v in bbox)
+            g = shapelyBox(west, south, east, north)
+            return hitName, g.wkt
+        except Exception:
+            pass
 
-    gdf = None
-    boundaryErr = None
-    try:
-        throttleNominatim()
-        if typePrefix and osmId:
-            gdf = ox.geocode_to_gdf(f"{typePrefix}{osmId}", by_osmid=True)
-        else:
-            gdf = ox.geocode_to_gdf(hitName)
-    except Exception as e:
-        boundaryErr = e
-
-    if boundaryErr is not None or gdf is None or gdf.empty or gdf.iloc[0].geometry.geom_type not in ("Polygon", "MultiPolygon"):
-        bbox = top_hit.get("boundingbox")
-        if bbox and len(bbox) == 4:
-            try:
-                south, north, west, east = (float(v) for v in bbox)
-                g = shapelyBox(west, south, east, north)
-                return hitName, g.wkt
-            except Exception:
-                pass
-
-        if boundaryErr is not None:
-            raise ValueError(
-                f'Found **"{hitName}"** but could not get its precise boundary, and no '
-                f'fallback bounding box was available either.\n\n'
-                f'Raw error: `{boundaryErr}`'
-            )
-        raise ValueError(
-            f'**"{hitName}"** is in OSM but only as a point, not a boundary polygon.\n\n'
-            f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
-        )
-
-    g = gdf.iloc[0].geometry
-    if not g.is_valid:
-        g = g.buffer(0)
-    return hitName, g.wkt
+    raise ValueError(
+        f'**"{hitName}"** was found but has no boundary polygon or bounding box on OpenStreetMap.\n\n'
+        f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
+    )
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
