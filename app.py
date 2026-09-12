@@ -22,7 +22,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-11-03-shutdownfix"
+BUILD_MARKER = "diag-2026-09-11-04-nodefallback"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -763,16 +763,43 @@ def findCampus(name):
         except Exception:
             continue
 
-    top_hit = edu_hits[0]
+    # No hit had a usable polygon. Before falling back to a raw bounding box,
+    # prefer a "relation" or "way" hit over a bare "node" (point) -- a node's
+    # Nominatim bbox is tiny (tens of meters), which for a real campus almost
+    # always misses every actual building/road, silently producing "no data"
+    # even though OSM has plenty of data for the school. Prefer whichever hit
+    # has the largest bbox area as a proxy for "most likely a real boundary".
+    def _bboxArea(hit):
+        bbox = hit.get("boundingbox")
+        if not bbox or len(bbox) != 4:
+            return 0.0
+        try:
+            south, north, west, east = (float(v) for v in bbox)
+            return max(0.0, north - south) * max(0.0, east - west)
+        except Exception:
+            return 0.0
+
+    typeRank = {"relation": 0, "way": 1, "node": 2}
+    ranked = sorted(
+        edu_hits,
+        key=lambda h: (typeRank.get(h.get("osm_type"), 3), -_bboxArea(h))
+    )
+    top_hit = ranked[0]
     hitName = top_hit.get("display_name", name)
 
-    # queryNominatim already requests polygon_geojson=1, so if we reach here
-    # it means the hit had no usable polygon in that response. Fall back to
-    # the bounding box Nominatim always provides -- no second network call.
     bbox = top_hit.get("boundingbox")
     if bbox and len(bbox) == 4:
         try:
             south, north, west, east = (float(v) for v in bbox)
+            # A bare node's bbox is a tiny square around one point -- pad it
+            # out to a sane minimum footprint (roughly 400m x 400m) so the
+            # Overpass query has a real chance of catching nearby campus
+            # buildings/roads instead of guaranteed-empty results.
+            MIN_SPAN_DEG = 0.0018  # ~200m at mid latitudes, so ~400m box
+            if (north - south) < MIN_SPAN_DEG or (east - west) < MIN_SPAN_DEG:
+                cy, cx = (north + south) / 2, (east + west) / 2
+                south, north = cy - MIN_SPAN_DEG, cy + MIN_SPAN_DEG
+                west, east = cx - MIN_SPAN_DEG, cx + MIN_SPAN_DEG
             g = shapelyBox(west, south, east, north)
             return hitName, g.wkt
         except Exception:
@@ -834,7 +861,15 @@ def prepareCampusData(polygon_wkt, active_layers, status):
         foundAnything = True
 
     if not foundAnything:
-        raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
+        area_deg2 = (maxx - minx) * (maxy - miny)
+        raise ValueError(
+            f"OSM has no roads, paths, buildings, or facilities tagged inside the matched "
+            f"boundary for this campus (searched area: roughly {minx:.4f},{miny:.4f} to "
+            f"{maxx:.4f},{maxy:.4f}, ~{area_deg2*111*111:.2f} km²). This usually means the "
+            f"name matched a point or a very small/wrong area on OpenStreetMap rather than "
+            f"the actual campus footprint. Try adding the city and state, or check the name "
+            f"on openstreetmap.org."
+        )
 
     status.write("Indexing named buildings and roads for search...")
 
