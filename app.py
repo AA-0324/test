@@ -852,40 +852,53 @@ def findCampus(name):
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
-def _fetchWithRetry(fn, args, deadline_seconds, label, status):
+def _fetchJob(fn, args, deadline_seconds, label):
     """
-    Try fn(*args) under a hard deadline; on failure, wait briefly and try
-    ONE more time (fresh -- these fetch functions now raise rather than
-    cache empty results, so a retry genuinely hits the network again, not
-    a cached false negative). Returns (result, lastError). Bounded to 2
-    attempts total so worst case is ~2x deadline_seconds, not unbounded.
+    Pure data function, NO Streamlit calls -- safe to run inside a worker
+    thread (unlike status.write, which needs the main-thread script-run
+    context). Try fn(*args) under a hard deadline; on failure, wait briefly
+    and try ONE more time fresh (these fetch functions raise rather than
+    cache empty results, so a retry genuinely hits the network again).
+    Returns (result, lastError, didRetry).
     """
     lastErr = None
     for attempt in range(2):
         try:
-            return runWithDeadline(fn, args, deadline_seconds, label), None
+            return runWithDeadline(fn, args, deadline_seconds, label), None, attempt > 0
         except Exception as e:
             lastErr = e
             if attempt == 0:
-                status.write(f"⏳ {label} came back empty/failed once, retrying...")
-                time.sleep(2)
-    return None, lastErr
+                time.sleep(1)
+    return None, lastErr, True
 
 
 def prepareCampusData(polygon_wkt, active_layers, status):
     from shapely import wkt as swkt
+    import concurrent.futures
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
 
     layerData = {}
 
-    status.update(label="Fetching roads and pedestrian paths...")
+    # Roads and buildings are two independent Overpass queries -- there's no
+    # reason to wait for one to finish before starting the other. Running
+    # them concurrently roughly halves the typical wall-clock time compared
+    # to doing them one after another. All Streamlit status.write() calls
+    # happen AFTER both jobs finish, back on the main thread -- status is a
+    # UI object and calling it from a worker thread is unsafe (same class of
+    # bug as the earlier st.session_state-in-a-thread issue).
+    status.update(label="Fetching roads, paths, buildings, and facilities...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        roadFuture = pool.submit(_fetchJob, fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch")
+        buildFuture = pool.submit(_fetchJob, fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch")
+        roadResult, roadErr, roadRetried = roadFuture.result()
+        buildResult, buildErr, buildRetried = buildFuture.result()
+
     roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
-    roadResult, roadErr = _fetchWithRetry(
-        fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch", status
-    )
     if roadResult is not None:
         roadGeo, walkGeo, namedRoads, namedRoadGeo = roadResult
+        if roadRetried:
+            status.write("⏳ Road/path fetch needed a retry, but succeeded.")
         status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                      f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
     else:
@@ -893,13 +906,11 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
 
-    status.update(label="Fetching buildings and facilities...")
     bldGdf, facGdf = None, None
-    buildResult, buildErr = _fetchWithRetry(
-        fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch", status
-    )
     if buildResult is not None:
         bldGdf, facGdf = buildResult
+        if buildRetried:
+            status.write("⏳ Building fetch needed a retry, but succeeded.")
     else:
         status.write(f"⚠️ Building data unavailable after retry ({buildErr}) — continuing with roads/paths only.")
 
