@@ -22,7 +22,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-12-05-latlonfallback"
+BUILD_MARKER = "diag-2026-09-12-07-retryfix"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -229,6 +229,14 @@ campusNameHints = (
     "mit.edu",
 )
 
+# "mit" (and to a lesser extent a few other short hints) is a substring of
+# many unrelated words -- "Admit", "Committee", "Summit", "Marriott" would
+# all incorrectly match with a plain "in" check. Word-boundary regexes make
+# these only match whole words/phrases instead of anywhere inside a word.
+_campusNameHintPatterns = [
+    re.compile(r"\b" + re.escape(h) + r"\b", re.IGNORECASE) for h in campusNameHints
+]
+
 
 def looksLikeCampus(nominatimResult):
     pair = (nominatimResult.get("class"), nominatimResult.get("type"))
@@ -242,7 +250,7 @@ def looksLikeCampus(nominatimResult):
     dn = nominatimResult.get("display_name") or ""
     if not isinstance(dn, str):
         dn = str(dn)
-    return any(hint in dn.lower() for hint in campusNameHints)
+    return any(p.search(dn) for p in _campusNameHintPatterns)
 
 
 PHOTON_URL = "https://photon.komoot.io/api/"
@@ -593,7 +601,17 @@ def fetchRoadsAndWalkways(polygon_wkt):
     allowed = WALKWAY_VALUES + ROAD_VALUES
     gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": allowed})
     if gdf is None or gdf.empty or "highway" not in gdf.columns:
-        return None, None, {}, {}
+        # Deliberately RAISE rather than return an empty result. This function
+        # is @st.cache_data-decorated by polygon -- a successful-but-empty
+        # return gets cached for 24h as "this campus permanently has no
+        # roads", even if the empty result was actually a transient Overpass
+        # hiccup (rate limit, momentary server issue, a big/complex query
+        # getting cut short). Raising means nothing gets cached, so a retry
+        # -- automatic or user-triggered -- can genuinely hit the network
+        # again instead of replaying a false negative for 24 hours.
+        raise RuntimeError(
+            "Overpass returned no road/path data for this area (possibly transient)"
+        )
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
     gdf = _capFeatures(gdf)
@@ -655,7 +673,12 @@ def fetchBuildingsAndFacilities(polygon_wkt):
         "leisure": FACILITY_LEISURE_VALUES,
     })
     if gdf is None or gdf.empty:
-        return None, None
+        # See fetchRoadsAndWalkways for why this raises instead of returning
+        # an empty result -- avoids permanently caching a transient failure
+        # as "this campus has no buildings" for 24h.
+        raise RuntimeError(
+            "Overpass returned no building data for this area (possibly transient)"
+        )
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
     gdf = _capFeatures(gdf)
@@ -738,7 +761,7 @@ def findCampus(name):
         # top result anyway rather than showing a hard failure -- the user
         # knows what they searched for.
         name_lower = name.lower()
-        query_looks_educational = any(hint in name_lower for hint in campusNameHints)
+        query_looks_educational = any(p.search(name_lower) for p in _campusNameHintPatterns)
         if query_looks_educational and results:
             edu_hits = results[:1]
 
@@ -829,6 +852,26 @@ def findCampus(name):
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
+def _fetchWithRetry(fn, args, deadline_seconds, label, status):
+    """
+    Try fn(*args) under a hard deadline; on failure, wait briefly and try
+    ONE more time (fresh -- these fetch functions now raise rather than
+    cache empty results, so a retry genuinely hits the network again, not
+    a cached false negative). Returns (result, lastError). Bounded to 2
+    attempts total so worst case is ~2x deadline_seconds, not unbounded.
+    """
+    lastErr = None
+    for attempt in range(2):
+        try:
+            return runWithDeadline(fn, args, deadline_seconds, label), None
+        except Exception as e:
+            lastErr = e
+            if attempt == 0:
+                status.write(f"⏳ {label} came back empty/failed once, retrying...")
+                time.sleep(2)
+    return None, lastErr
+
+
 def prepareCampusData(polygon_wkt, active_layers, status):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
@@ -838,25 +881,27 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     status.update(label="Fetching roads and pedestrian paths...")
     roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
-    try:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = runWithDeadline(
-            fetchRoadsAndWalkways, (polygon_wkt,), 75, "Road/path fetch"
-        )
+    roadResult, roadErr = _fetchWithRetry(
+        fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch", status
+    )
+    if roadResult is not None:
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = roadResult
         status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                      f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
-    except Exception as e:
-        status.write(f"⚠️ Road/path data unavailable ({e}) — continuing with buildings only.")
+    else:
+        status.write(f"⚠️ Road/path data unavailable after retry ({roadErr}) — continuing with buildings only.")
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
 
     status.update(label="Fetching buildings and facilities...")
     bldGdf, facGdf = None, None
-    try:
-        bldGdf, facGdf = runWithDeadline(
-            fetchBuildingsAndFacilities, (polygon_wkt,), 75, "Building fetch"
-        )
-    except Exception as e:
-        status.write(f"⚠️ Building data unavailable ({e}) — continuing with roads/paths only.")
+    buildResult, buildErr = _fetchWithRetry(
+        fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch", status
+    )
+    if buildResult is not None:
+        bldGdf, facGdf = buildResult
+    else:
+        status.write(f"⚠️ Building data unavailable after retry ({buildErr}) — continuing with roads/paths only.")
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
@@ -879,13 +924,21 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     if not foundAnything:
         area_deg2 = (maxx - minx) * (maxy - miny)
+        reasons = []
+        if roadErr is not None:
+            reasons.append(f"roads/paths: {roadErr}")
+        if buildErr is not None:
+            reasons.append(f"buildings: {buildErr}")
+        reasonText = " | ".join(reasons) if reasons else "no specific error was raised, both fetches simply returned empty"
         raise ValueError(
             f"OSM has no roads, paths, buildings, or facilities tagged inside the matched "
-            f"boundary for this campus (searched area: roughly {minx:.4f},{miny:.4f} to "
-            f"{maxx:.4f},{maxy:.4f}, ~{area_deg2*111*111:.2f} km²). This usually means the "
-            f"name matched a point or a very small/wrong area on OpenStreetMap rather than "
-            f"the actual campus footprint. Try adding the city and state, or check the name "
-            f"on openstreetmap.org."
+            f"boundary for this campus after retrying (searched area: roughly "
+            f"{minx:.4f},{miny:.4f} to {maxx:.4f},{maxy:.4f}, ~{area_deg2*111*111:.2f} km²).\n\n"
+            f"Underlying reason(s): {reasonText}\n\n"
+            f"This usually means either OpenStreetMap's Overpass service was temporarily "
+            f"overloaded (try again in a minute) or the matched boundary is a point/wrong "
+            f"area rather than the actual campus footprint. Try adding the city and state, "
+            f"or check the name on openstreetmap.org."
         )
 
     status.write("Indexing named buildings and roads for search...")
