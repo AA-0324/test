@@ -22,7 +22,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-11-04-nodefallback"
+BUILD_MARKER = "diag-2026-09-12-05-latlonfallback"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -787,6 +787,8 @@ def findCampus(name):
     top_hit = ranked[0]
     hitName = top_hit.get("display_name", name)
 
+    MIN_SPAN_DEG = 0.0018  # ~200m at mid latitudes, so ~400m box
+
     bbox = top_hit.get("boundingbox")
     if bbox and len(bbox) == 4:
         try:
@@ -795,7 +797,6 @@ def findCampus(name):
             # out to a sane minimum footprint (roughly 400m x 400m) so the
             # Overpass query has a real chance of catching nearby campus
             # buildings/roads instead of guaranteed-empty results.
-            MIN_SPAN_DEG = 0.0018  # ~200m at mid latitudes, so ~400m box
             if (north - south) < MIN_SPAN_DEG or (east - west) < MIN_SPAN_DEG:
                 cy, cx = (north + south) / 2, (east + west) / 2
                 south, north = cy - MIN_SPAN_DEG, cy + MIN_SPAN_DEG
@@ -805,8 +806,24 @@ def findCampus(name):
         except Exception:
             pass
 
+    # No boundingbox at all -- this is the common case for Photon-sourced
+    # results (queryPhoton only sets boundingbox when the source feature has
+    # an "extent", which point-type results usually lack). Photon and
+    # Nominatim both always provide lat/lon though, so build a padded box
+    # around the point instead of giving up entirely.
+    lat, lon = top_hit.get("lat"), top_hit.get("lon")
+    if lat is not None and lon is not None:
+        try:
+            lat, lon = float(lat), float(lon)
+            g = shapelyBox(lon - MIN_SPAN_DEG, lat - MIN_SPAN_DEG,
+                            lon + MIN_SPAN_DEG, lat + MIN_SPAN_DEG)
+            return hitName, g.wkt
+        except Exception:
+            pass
+
     raise ValueError(
-        f'**"{hitName}"** was found but has no boundary polygon or bounding box on OpenStreetMap.\n\n'
+        f'**"{hitName}"** was found but has no boundary polygon, bounding box, or even '
+        f'coordinates on OpenStreetMap.\n\n'
         f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
     )
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
