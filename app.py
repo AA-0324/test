@@ -623,6 +623,28 @@ def _propagateRoadNames(features, maxHops=6):
     return effectiveName
 
 
+def _overpassFetch(poly, tags):
+    """
+    Route to the cheapest Overpass query available for this geometry.
+    features_from_polygon requires Overpass to do point-in-polygon clipping
+    against every candidate element server-side -- meaningfully more
+    expensive than a plain coordinate-range filter. Many of our campus
+    boundaries ARE already simple axis-aligned rectangles (the bbox
+    fallback path, and the padded-point fallback both produce boxes) --
+    for those, features_from_bbox returns the identical result set for
+    less server-side work. A tolerance-based check (poly is very close to
+    its own envelope) catches these without needing to track a flag through
+    every caller.
+    """
+    is_rectangle = poly.equals_exact(poly.envelope, tolerance=1e-9) or \
+        poly.symmetric_difference(poly.envelope).area < (poly.area * 0.001)
+    if is_rectangle:
+        west, south, east, north = poly.bounds
+        # OSMnx 2.x bbox order is (left, bottom, right, top) i.e. (west, south, east, north).
+        return ox.features_from_bbox((west, south, east, north), tags)
+    return ox.features_from_polygon(poly, tags)
+
+
 def fetchRoadsAndWalkways(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
@@ -632,7 +654,7 @@ def fetchRoadsAndWalkways(polygon_wkt):
     # (which pulls every highway type, including motorways/trunks/etc that
     # get filtered right back out below -- unnecessarily slow for no benefit).
     allowed = WALKWAY_VALUES + ROAD_VALUES
-    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": allowed})
+    gdf = fetchFromOverpass(_overpassFetch, poly, {"highway": allowed})
     if gdf is None or gdf.empty or "highway" not in gdf.columns:
         # Deliberately RAISE rather than return an empty result. This function
         # is @st.cache_data-decorated by polygon -- a successful-but-empty
