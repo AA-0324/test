@@ -23,7 +23,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-12-08-mirrorspeed"
+BUILD_MARKER = "diag-2026-09-13-10-parallel-timed"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -164,6 +164,9 @@ def initOsmnx():
     return True
 
 
+_overpassSettingsLock = threading.Lock()
+
+
 def fetchFromOverpass(fetchFn, *args):
     # No _status param: called from inside st.cache_data functions where
     # writing to Streamlit widgets is forbidden and causes the cached-replay crash.
@@ -176,17 +179,30 @@ def fetchFromOverpass(fetchFn, *args):
     # temporarily overloaded "first" mirror doesn't get hit first on every
     # single request from every user -- spreads load, improves the odds any
     # given call lands on a healthy mirror immediately.
+    #
+    # ox.settings.overpass_url is a SHARED GLOBAL, and roads/buildings now
+    # fetch concurrently in two threads. Without a lock, thread A could set
+    # the mirror, then thread B overwrites it before thread A's actual HTTP
+    # call reads it -- A silently ends up hitting a mirror it never chose.
+    # The lock makes "pick a mirror, then make the full request" one atomic
+    # unit, so the two concurrent fetches never stomp on each other's
+    # mirror selection (this does mean the two Overpass network calls
+    # themselves are serialized relative to each other, but each one still
+    # overlaps with the OTHER thread's local post-processing/simplification
+    # work, which is not nothing).
     mirrors = list(OVERPASS_MIRRORS)
     random.shuffle(mirrors)
     lastErr = None
     for mirror in mirrors:
-        ox.settings.overpass_url = mirror
-        try:
-            return fetchFn(*args)
-        except Exception as e:
-            lastErr = e
-            continue
-    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
+        with _overpassSettingsLock:
+            ox.settings.overpass_url = mirror
+            try:
+                return fetchFn(*args)
+            except Exception as e:
+                lastErr = e
+                continue
+    with _overpassSettingsLock:
+        ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     raise RuntimeError(
         f"OpenStreetMap's Overpass data service didn't respond after trying "
         f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
@@ -876,17 +892,24 @@ def _fetchJob(fn, args, deadline_seconds, label):
     context). Try fn(*args) under a hard deadline; on failure, wait briefly
     and try ONE more time fresh (these fetch functions raise rather than
     cache empty results, so a retry genuinely hits the network again).
-    Returns (result, lastError, didRetry).
+    Returns (result, lastError, didRetry, elapsedSeconds). Elapsed time is
+    measured from inside this worker thread itself, not inferred from when
+    the main thread happens to call .result() -- two jobs running
+    concurrently can finish in either order, and timing them via sequential
+    .result() calls on the main thread would misreport whichever one
+    finishes second as having taken as long as both combined.
     """
+    _t0 = time.time()
     lastErr = None
     for attempt in range(2):
         try:
-            return runWithDeadline(fn, args, deadline_seconds, label), None, attempt > 0
+            result = runWithDeadline(fn, args, deadline_seconds, label)
+            return result, None, attempt > 0, time.time() - _t0
         except Exception as e:
             lastErr = e
             if attempt == 0:
                 time.sleep(1)
-    return None, lastErr, True
+    return None, lastErr, True, time.time() - _t0
 
 
 def prepareCampusData(polygon_wkt, active_layers, status):
@@ -897,25 +920,33 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     layerData = {}
 
-    # Roads and buildings are two independent Overpass queries -- there's no
-    # reason to wait for one to finish before starting the other. Running
-    # them concurrently roughly halves the typical wall-clock time compared
-    # to doing them one after another. All Streamlit status.write() calls
-    # happen AFTER both jobs finish, back on the main thread -- status is a
-    # UI object and calling it from a worker thread is unsafe (same class of
-    # bug as the earlier st.session_state-in-a-thread issue).
+    # Back to CONCURRENT fetching -- restoring full speed. The previous
+    # "make it sequential" change was based on an unverified theory about
+    # Overpass's per-IP concurrent-slot limit, and there's no way to confirm
+    # or rule that out without seeing real timing data from an actual slow
+    # run. Instead of trading away speed on a guess, this now times every
+    # stage explicitly and reports it in the status box, so the next slow
+    # run produces hard numbers (which exact stage is slow, and by how much)
+    # instead of more speculation.
+    t0 = time.time()
     status.update(label="Fetching roads, paths, buildings, and facilities...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         roadFuture = pool.submit(_fetchJob, fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch")
         buildFuture = pool.submit(_fetchJob, fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch")
-        roadResult, roadErr, roadRetried = roadFuture.result()
-        buildResult, buildErr, buildRetried = buildFuture.result()
+        roadResult, roadErr, roadRetried, roadElapsed = roadFuture.result()
+        buildResult, buildErr, buildRetried, buildElapsed = buildFuture.result()
+
+    status.write(
+        f"⏱️ Roads/paths took {roadElapsed:.1f}s"
+        + (" (needed a retry)" if roadRetried else "")
+        + f" | Buildings/facilities took {buildElapsed:.1f}s"
+        + (" (needed a retry)" if buildRetried else "")
+        + " — both ran concurrently, so wall-clock time is roughly the SLOWER of the two, not the sum."
+    )
 
     roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
     if roadResult is not None:
         roadGeo, walkGeo, namedRoads, namedRoadGeo = roadResult
-        if roadRetried:
-            status.write("⏳ Road/path fetch needed a retry, but succeeded.")
         status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                      f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
     else:
@@ -926,8 +957,6 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     bldGdf, facGdf = None, None
     if buildResult is not None:
         bldGdf, facGdf = buildResult
-        if buildRetried:
-            status.write("⏳ Building fetch needed a retry, but succeeded.")
     else:
         status.write(f"⚠️ Building data unavailable after retry ({buildErr}) — continuing with roads/paths only.")
 
@@ -936,6 +965,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
     status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
                  f"Facilities: {len(facGdf) if facGdf is not None else 0}")
+    status.write(f"⏱️ Total data fetch: {time.time() - t0:.1f}s")
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     counts = {}
@@ -1323,11 +1353,14 @@ if not searchTerm:
 
 if "campusData" not in st.session_state:
     err = None
+    _searchStartTime = time.time()
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
+            _geoStart = time.time()
             campusName, campusPoly = runWithDeadline(findCampus, (searchTerm,), 60, "Campus lookup")
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
+            status.write(f"⏱️ Geocoding took {time.time() - _geoStart:.1f}s")
         except TimeoutError as e:
             status.update(label="Timed out", state="error")
             err = ("error", str(e))
@@ -1355,6 +1388,7 @@ if "campusData" not in st.session_state:
                 st.session_state["namedLocations"] = namedLocations
                 st.session_state["namedRoads"] = namedRoads
                 st.session_state["namedRoadGeo"] = namedRoadGeo
+                status.write(f"⏱️ **Grand total, click to map ready: {time.time() - _searchStartTime:.1f}s**")
                 status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
             except ValueError as e:
                 status.update(label="Couldn't build the map", state="error")
