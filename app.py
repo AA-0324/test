@@ -11,6 +11,7 @@ import time
 import html
 import re
 import threading
+import random
 import requests
 from collections import deque
 import pandas as pd
@@ -22,7 +23,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-12-07-retryfix"
+BUILD_MARKER = "diag-2026-09-12-08-mirrorspeed"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -149,7 +150,16 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 25
+    # 13s per mirror x 3 mirrors = 39s worst case, comfortably inside the
+    # 45s external deadline in _fetchJob. The PREVIOUS value (25s) meant a
+    # single slow mirror could burn through most of the external deadline by
+    # itself, getting killed mid-attempt on mirror #2 before ever reaching
+    # mirror #3 -- then the retry would restart from mirror #1 again (the
+    # same slow one), repeating the same wasted time. This is very likely
+    # the real cause of the wildly inconsistent load times (30s-102s) rather
+    # than query complexity: a lucky first mirror = fast, an unlucky one =
+    # a wasted near-timeout followed by a full restart.
+    ox.settings.requests_timeout = 13
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
@@ -161,8 +171,15 @@ def fetchFromOverpass(fetchFn, *args):
     # multiple times with long timeouts previously multiplied worst-case wait
     # to several minutes per call, which is indistinguishable from "stuck" to
     # a user. The hard deadline in runWithDeadline() is the real safety net.
+    #
+    # Mirrors are shuffled per call (not always starting at mirrors[0]) so a
+    # temporarily overloaded "first" mirror doesn't get hit first on every
+    # single request from every user -- spreads load, improves the odds any
+    # given call lands on a healthy mirror immediately.
+    mirrors = list(OVERPASS_MIRRORS)
+    random.shuffle(mirrors)
     lastErr = None
-    for mirror in OVERPASS_MIRRORS:
+    for mirror in mirrors:
         ox.settings.overpass_url = mirror
         try:
             return fetchFn(*args)
