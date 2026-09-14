@@ -299,7 +299,7 @@ PHOTON_URL = "https://photon.komoot.io/api/"
 
 def queryPhoton(q, limit=5):
     p = {"q": q, "limit": limit}
-    r = requests.get(PHOTON_URL, params=p, headers=req_headers, timeout=10)
+    r = requests.get(PHOTON_URL, params=p, headers=req_headers, timeout=(3, 10))
     r.raise_for_status()
     data = r.json()
 
@@ -342,14 +342,14 @@ def queryNominatim(q, limit=5):
         "polygon_geojson": 1,
     }
     maxAttempts = 2
-    backoffs = [2, 5]
+    backoffs = [1, 3]
     lastStatus = None
     lastBody = None
 
     for attempt in range(maxAttempts):
         throttleNominatim()
         try:
-            r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
+            r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=(3, 10))
         except requests.exceptions.RequestException as e:
             if attempt == maxAttempts - 1:
                 raise ValueError(f"Could not reach OpenStreetMap's search service: `{e}`")
@@ -646,7 +646,7 @@ def _overpassFetch(poly, tags):
     building count as on-campus" and meaningfully cuts vertex count for a
     highly detailed shape.
     """
-    QUERY_SIMPLIFY_TOLERANCE = 0.00015  # ~15m at mid-latitudes
+    QUERY_SIMPLIFY_TOLERANCE = 0.0003  # ~30m at mid-latitudes
     try:
         simplified = poly.simplify(QUERY_SIMPLIFY_TOLERANCE, preserve_topology=True)
         if not simplified.is_empty and simplified.is_valid:
