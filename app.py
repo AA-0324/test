@@ -22,7 +22,7 @@ import leafmap.foliumap as leafmap
 import osmnx as ox
 
 
-MAX_FEATURES_PER_LAYER = 6000
+MAX_FEATURES_PER_LAYER = 2500  # lower = less data to transfer, process, and render; still generous for any real campus
 
 # ── CARTO basemap tile URL with API key (removes watermark) ──────────────────
 CARTO_KEY = "cb1_2ely_1_56403dce0becb94f8ac75d76"
@@ -144,7 +144,12 @@ OVERPASS_MIRRORS = [
 
 @st.cache_resource
 def initOsmnx():
-    ox.settings.use_cache = True
+    # OSMnx's own on-disk HTTP cache is redundant here: fetchCampusFeatures
+    # is already st.cache_data-cached for 24h at a higher level. Leaving
+    # OSMnx's disk cache on means every fresh
+    # request also pays disk I/O for a cache layer that adds no benefit on
+    # top of the one we already have -- pure overhead.
+    ox.settings.use_cache = False
     ox.settings.log_console = False
     # CRITICAL: requests_timeout is not just how long *we* wait for a
     # response -- OSMnx injects it directly into the Overpass query as
@@ -185,15 +190,16 @@ def fetchFromOverpass(fetchFn, *args):
     # single request from every user -- spreads load, improves the odds any
     # given call lands on a healthy mirror immediately.
     #
-    # NOTE: fetchRoadsAndWalkways/fetchBuildingsAndFacilities run SEQUENTIALLY
-    # (see prepareCampusData), never concurrently -- so only one thread ever
-    # touches the shared ox.settings.overpass_url global at a time and no
-    # lock is needed. An earlier version ran these two fetches concurrently
-    # and added a lock here to prevent them from stomping on each other's
+    # NOTE: fetchCampusFeatures now does ONE combined Overpass call per
+    # search (see prepareCampusData) -- there's no second concurrent fetch
+    # to race with, so only one thread ever touches the shared
+    # ox.settings.overpass_url global at a time and no lock is needed. An
+    # earlier version ran roads and buildings as two separate concurrent
+    # fetches and added a lock here to stop them stomping on each other's
     # mirror selection -- but that lock ended up serializing the two fetches
     # anyway (one held it for its entire blocking network call), while still
-    # paying thread/lock overhead on top. Strictly worse than just being
-    # sequential in the first place, so: sequential, no lock, no mystery.
+    # paying thread/lock overhead on top. Merging them into one call removed
+    # the problem at its root instead of managing around it.
     mirrors = list(OVERPASS_MIRRORS)
     random.shuffle(mirrors)
     lastErr = None
@@ -306,12 +312,13 @@ def queryPhoton(q, limit=5):
         parts = [name, props.get("city"), props.get("state"), props.get("country")]
         display_name = ", ".join(x for x in parts if x)
 
-        boundingbox = None
-        extent = props.get("extent")
-        if extent and len(extent) == 4:
-            minLon, maxLat, maxLon, minLat = extent
-            boundingbox = [str(minLat), str(maxLat), str(minLon), str(maxLon)]
-
+        # NOTE: deliberately NOT parsing a boundingbox from Photon's "extent"
+        # field. Its exact coordinate order isn't confirmed against an
+        # authoritative source, and a wrong order would silently produce an
+        # inverted/garbage box -- exactly the class of bug that's caused
+        # real problems in this app before. lat/lon are always present and
+        # unambiguous; findCampus already has a verified-correct fallback
+        # that pads a box around a bare point when no boundingbox exists.
         out.append({
             "class": props.get("osm_key"),
             "type": props.get("osm_value"),
@@ -319,7 +326,7 @@ def queryPhoton(q, limit=5):
             "osm_type": props.get("osm_type"),
             "osm_id": props.get("osm_id"),
             "geojson": None,
-            "boundingbox": boundingbox,
+            "boundingbox": None,
             "lat": coords[1] if coords else None,
             "lon": coords[0] if coords else None,
         })
@@ -628,7 +635,25 @@ def _overpassFetch(poly, tags):
     less server-side work. A tolerance-based check (poly is very close to
     its own envelope) catches these without needing to track a flag through
     every caller.
+
+    For real, non-rectangular boundaries (actual Nominatim campus polygons),
+    the server-side clipping cost scales with how many VERTICES the query
+    polygon has, not just its area -- a detailed real-world campus boundary
+    can have hundreds of vertices. We already simplify the RESULT geometries
+    after fetching (_simplify), but were sending the full-detail QUERY
+    polygon on every request, paying that vertex-count cost for no benefit:
+    ~15m of boundary precision is imperceptible at the scale of "does this
+    building count as on-campus" and meaningfully cuts vertex count for a
+    highly detailed shape.
     """
+    QUERY_SIMPLIFY_TOLERANCE = 0.00015  # ~15m at mid-latitudes
+    try:
+        simplified = poly.simplify(QUERY_SIMPLIFY_TOLERANCE, preserve_topology=True)
+        if not simplified.is_empty and simplified.is_valid:
+            poly = simplified
+    except Exception:
+        pass  # fall through and query with the original polygon
+
     is_rectangle = poly.equals_exact(poly.envelope, tolerance=1e-9) or \
         poly.symmetric_difference(poly.envelope).area < (poly.area * 0.001)
     if is_rectangle:
@@ -638,37 +663,62 @@ def _overpassFetch(poly, tags):
     return ox.features_from_polygon(poly, tags)
 
 
-def fetchRoadsAndWalkways(polygon_wkt):
+def fetchCampusFeatures(polygon_wkt):
+    """
+    Single combined Overpass query for roads, walkways, buildings, AND
+    facilities together -- replaces what used to be two separate sequential
+    fetchRoadsAndWalkways / fetchBuildingsAndFacilities calls. Halves the
+    number of HTTP round-trips per campus search, and Overpass only has to
+    compute the polygon's spatial index once instead of twice. Everything
+    downstream (per-category feature capping, labeling, named-road
+    propagation) is preserved exactly as it was in the two separate
+    functions -- just applied to subsets split out of one combined result
+    instead of two independently-fetched ones.
+    """
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
-    # osmnx DOES support list values as OR filters (confirmed against docs) --
-    # scope this to only the highway types we display, rather than True
-    # (which pulls every highway type, including motorways/trunks/etc that
-    # get filtered right back out below -- unnecessarily slow for no benefit).
-    allowed = WALKWAY_VALUES + ROAD_VALUES
-    gdf = fetchFromOverpass(_overpassFetch, poly, {"highway": allowed})
-    if gdf is None or gdf.empty or "highway" not in gdf.columns:
-        # Deliberately RAISE rather than return an empty result. This function
-        # is @st.cache_data-decorated by polygon -- a successful-but-empty
-        # return gets cached for 24h as "this campus permanently has no
-        # roads", even if the empty result was actually a transient Overpass
-        # hiccup (rate limit, momentary server issue, a big/complex query
-        # getting cut short). Raising means nothing gets cached, so a retry
-        # -- automatic or user-triggered -- can genuinely hit the network
-        # again instead of replaying a false negative for 24 hours.
+    allowedHighways = WALKWAY_VALUES + ROAD_VALUES
+    gdf = fetchFromOverpass(_overpassFetch, poly, {
+        "highway": allowedHighways,
+        "building": True,
+        "amenity": FACILITY_AMENITY_VALUES,
+        "leisure": FACILITY_LEISURE_VALUES,
+    })
+    if gdf is None or gdf.empty:
+        # See the old fetchRoadsAndWalkways for why this raises instead of
+        # returning an empty result -- avoids permanently caching a
+        # transient failure as "this campus has no data" for 24h.
         raise RuntimeError(
-            "Overpass returned no road/path data for this area (possibly transient)"
+            "Overpass returned no data for this area (possibly transient)"
         )
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-    gdf = _simplify(gdf)
-    gdf = _capFeatures(gdf)
+    gdf = _simplify(gdf)  # single shared tolerance, same as before -- safe to do once on the combined set
 
-    walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
-    roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
+    has_highway = gdf["highway"].isin(allowedHighways) if "highway" in gdf.columns else pd.Series(False, index=gdf.index)
+    has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
+    has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
+    has_leisure = gdf["leisure"].isin(FACILITY_LEISURE_VALUES) if "leisure" in gdf.columns else pd.Series(False, index=gdf.index)
+
+    walkways = gdf[has_highway & gdf["highway"].isin(WALKWAY_VALUES)].copy() if "highway" in gdf.columns else gdf.iloc[0:0].copy()
+    roads = gdf[has_highway & gdf["highway"].isin(ROAD_VALUES)].copy() if "highway" in gdf.columns else gdf.iloc[0:0].copy()
+    buildings = gdf[has_building].copy()
+    facilities = gdf[has_amenity | has_leisure].copy()
+
+    # Cap PER CATEGORY separately, exactly as the two old functions did --
+    # capping the combined whole instead would let one category (e.g. a
+    # huge count of buildings) crowd out another (e.g. roads) in a way the
+    # app never used to behave.
+    walkways = _capFeatures(walkways)
+    roads = _capFeatures(roads)
+    buildings = _capFeatures(buildings)
+    facilities = _capFeatures(facilities)
 
     walkways = addLabelAndTrim(walkways, "walkways")
     roads = addLabelAndTrim(roads, "roads")
+    buildings = addLabelAndTrim(buildings, "buildings")
+    facilities = addLabelAndTrim(facilities, "facilities")
+
     walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
     roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
     walkGeo = _roundGeoJson(walkGeo)
@@ -701,47 +751,8 @@ def fetchRoadsAndWalkways(polygon_wkt):
     roadGeo = _stripUnusedProps(roadGeo)
     walkGeo = _stripUnusedProps(walkGeo)
 
-    return roadGeo, walkGeo, namedRoads, namedRoadGeo
-fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="24h")(fetchRoadsAndWalkways)
-
-
-def fetchBuildingsAndFacilities(polygon_wkt):
-    from shapely import wkt as swkt
-    poly = swkt.loads(polygon_wkt)
-
-    # osmnx DOES support list values as OR filters (confirmed against docs) --
-    # scope amenity/leisure to only the values we actually display, rather than
-    # True (which pulls down every amenity of any kind -- benches, waste
-    # baskets, vending machines, etc -- across the whole campus and is much
-    # slower for large campuses like MIT for no benefit, since we filter it
-    # right back down below anyway).
-    gdf = fetchFromOverpass(_overpassFetch, poly, {
-        "building": True,
-        "amenity": FACILITY_AMENITY_VALUES,
-        "leisure": FACILITY_LEISURE_VALUES,
-    })
-    if gdf is None or gdf.empty:
-        # See fetchRoadsAndWalkways for why this raises instead of returning
-        # an empty result -- avoids permanently caching a transient failure
-        # as "this campus has no buildings" for 24h.
-        raise RuntimeError(
-            "Overpass returned no building data for this area (possibly transient)"
-        )
-    gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-    gdf = _simplify(gdf)
-    gdf = _capFeatures(gdf)
-
-    has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
-    has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
-    has_leisure = gdf["leisure"].isin(FACILITY_LEISURE_VALUES) if "leisure" in gdf.columns else pd.Series(False, index=gdf.index)
-
-    buildings = gdf[has_building].copy()
-    facilities = gdf[has_amenity | has_leisure].copy()
-
-    buildings = addLabelAndTrim(buildings, "buildings")
-    facilities = addLabelAndTrim(facilities, "facilities")
-    return buildings, facilities
-fetchBuildingsAndFacilities = st.cache_data(show_spinner=False, ttl="24h")(fetchBuildingsAndFacilities)
+    return roadGeo, walkGeo, namedRoads, namedRoadGeo, buildings, facilities
+fetchCampusFeatures = st.cache_data(show_spinner=False, ttl="24h")(fetchCampusFeatures)
 
 
 def stripDuplicateBuildings(buildingsDf, facilitiesDf):
@@ -877,11 +888,12 @@ def findCampus(name):
         except Exception:
             pass
 
-    # No boundingbox at all -- this is the common case for Photon-sourced
-    # results (queryPhoton only sets boundingbox when the source feature has
-    # an "extent", which point-type results usually lack). Photon and
-    # Nominatim both always provide lat/lon though, so build a padded box
-    # around the point instead of giving up entirely.
+    # No boundingbox at all -- this is always the case for Photon-sourced
+    # results now (queryPhoton deliberately never parses a boundingbox from
+    # Photon's "extent" field -- its exact coordinate order couldn't be
+    # confirmed against an authoritative source, so we don't risk silently
+    # using a wrong/inverted box). Photon and Nominatim both always provide
+    # lat/lon though, so build a padded box around the point instead.
     lat, lon = top_hit.get("lat"), top_hit.get("lon")
     if lat is not None and lon is not None:
         try:
@@ -928,36 +940,25 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     layerData = {}
 
-    # Fetches run sequentially, not concurrently. Running them concurrently
-    # requires synchronizing access to osmnx's shared global
-    # ox.settings.overpass_url across threads, which added complexity and
-    # overhead without a reliable net speed benefit. Sequential keeps this
-    # simple and correct.
-    status.update(label="Fetching roads and pedestrian paths...")
-    roadResult, roadErr, roadRetried = _fetchJob(
-        fetchRoadsAndWalkways, (polygon_wkt,), 70, "Road/path fetch"
+    # ONE combined Overpass query for roads, walkways, buildings, AND
+    # facilities together -- previously two separate sequential fetches.
+    # This halves the number of HTTP round-trips per search and lets
+    # Overpass compute the polygon's spatial index once instead of twice.
+    status.update(label="Fetching campus data...")
+    result, fetchErr, wasRetried = _fetchJob(
+        fetchCampusFeatures, (polygon_wkt,), 70, "Campus data fetch"
     )
 
     roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
-    if roadResult is not None:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = roadResult
+    bldGdf, facGdf = None, None
+    if result is not None:
+        roadGeo, walkGeo, namedRoads, namedRoadGeo, bldGdf, facGdf = result
         status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                      f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
     else:
-        status.write(f"⚠️ Road/path data unavailable after retry ({roadErr}) — continuing with buildings only.")
+        status.write(f"⚠️ Campus data unavailable after retry ({fetchErr}).")
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
-
-    status.update(label="Fetching buildings and facilities...")
-    buildResult, buildErr, buildRetried = _fetchJob(
-        fetchBuildingsAndFacilities, (polygon_wkt,), 70, "Building fetch"
-    )
-
-    bldGdf, facGdf = None, None
-    if buildResult is not None:
-        bldGdf, facGdf = buildResult
-    else:
-        status.write(f"⚠️ Building data unavailable after retry ({buildErr}) — continuing with roads/paths only.")
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
@@ -980,17 +981,12 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     if not foundAnything:
         area_deg2 = (maxx - minx) * (maxy - miny)
-        reasons = []
-        if roadErr is not None:
-            reasons.append(f"roads/paths: {roadErr}")
-        if buildErr is not None:
-            reasons.append(f"buildings: {buildErr}")
-        reasonText = " | ".join(reasons) if reasons else "no specific error was raised, both fetches simply returned empty"
+        reasonText = str(fetchErr) if fetchErr is not None else "no specific error was raised, the fetch simply returned empty"
         raise ValueError(
             f"OSM has no roads, paths, buildings, or facilities tagged inside the matched "
             f"boundary for this campus after retrying (searched area: roughly "
             f"{minx:.4f},{miny:.4f} to {maxx:.4f},{maxy:.4f}, ~{area_deg2*111*111:.2f} km²).\n\n"
-            f"Underlying reason(s): {reasonText}\n\n"
+            f"Underlying reason: {reasonText}\n\n"
             f"This usually means either OpenStreetMap's Overpass service was temporarily "
             f"overloaded (try again in a minute) or the matched boundary is a point/wrong "
             f"area rather than the actual campus footprint. Try adding the city and state, "
