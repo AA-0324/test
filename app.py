@@ -8,22 +8,18 @@ st.set_page_config(
 )
 
 import time
-import html
 import re
 import threading
 import random
 import requests
 from collections import deque
 import pandas as pd
-import geopandas as gpd
 import folium
 from branca.element import MacroElement, Template
 from shapely.geometry import shape, box as shapelyBox
 from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
-
-BUILD_MARKER = "diag-2026-09-13-10-parallel-timed"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -150,21 +146,30 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    # 13s per mirror x 3 mirrors = 39s worst case, comfortably inside the
-    # 45s external deadline in _fetchJob. The PREVIOUS value (25s) meant a
-    # single slow mirror could burn through most of the external deadline by
-    # itself, getting killed mid-attempt on mirror #2 before ever reaching
-    # mirror #3 -- then the retry would restart from mirror #1 again (the
-    # same slow one), repeating the same wasted time. This is very likely
-    # the real cause of the wildly inconsistent load times (30s-102s) rather
-    # than query complexity: a lucky first mirror = fast, an unlucky one =
-    # a wasted near-timeout followed by a full restart.
-    ox.settings.requests_timeout = 13
+    # CRITICAL: requests_timeout is not just how long *we* wait for a
+    # response -- OSMnx injects it directly into the Overpass query as
+    # "[timeout:N]", which tells the OVERPASS SERVER how many seconds of
+    # actual query-execution time it's allowed before self-aborting.
+    # Confirmed directly against OSMnx's own docs: its own default is 180s.
+    # A previous change set this to 13s while chasing a since-disproven
+    # "mirror cycling" theory -- meaning EVERY query, even for a tiny campus,
+    # was being told to give up after 13s of real server-side work,
+    # regardless of network conditions or which mirror it hit. That is very
+    # likely the actual cause of every fresh campus being slow or failing
+    # outright (Deep Springs College erroring after 2 minutes): not bad luck
+    # or overload, but us telling the server to abort before it could ever
+    # realistically finish. 60s gives real breathing room for a normal
+    # campus query without going all the way to OSMnx's own 180s default.
+    ox.settings.requests_timeout = 60
+    # Confirmed against OSMnx docs: overpass_rate_limit (default True) makes
+    # OSMnx check the Overpass /status endpoint -- a full extra HTTP
+    # round-trip -- before EVERY query, purely to decide whether to
+    # pre-emptively sleep. We already have our own timeout, retry, and
+    # mirror-cycling logic as a safety net, so this adds latency to every
+    # single request with no real benefit here.
+    ox.settings.overpass_rate_limit = False
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
-
-
-_overpassSettingsLock = threading.Lock()
 
 
 def fetchFromOverpass(fetchFn, *args):
@@ -180,29 +185,26 @@ def fetchFromOverpass(fetchFn, *args):
     # single request from every user -- spreads load, improves the odds any
     # given call lands on a healthy mirror immediately.
     #
-    # ox.settings.overpass_url is a SHARED GLOBAL, and roads/buildings now
-    # fetch concurrently in two threads. Without a lock, thread A could set
-    # the mirror, then thread B overwrites it before thread A's actual HTTP
-    # call reads it -- A silently ends up hitting a mirror it never chose.
-    # The lock makes "pick a mirror, then make the full request" one atomic
-    # unit, so the two concurrent fetches never stomp on each other's
-    # mirror selection (this does mean the two Overpass network calls
-    # themselves are serialized relative to each other, but each one still
-    # overlaps with the OTHER thread's local post-processing/simplification
-    # work, which is not nothing).
+    # NOTE: fetchRoadsAndWalkways/fetchBuildingsAndFacilities run SEQUENTIALLY
+    # (see prepareCampusData), never concurrently -- so only one thread ever
+    # touches the shared ox.settings.overpass_url global at a time and no
+    # lock is needed. An earlier version ran these two fetches concurrently
+    # and added a lock here to prevent them from stomping on each other's
+    # mirror selection -- but that lock ended up serializing the two fetches
+    # anyway (one held it for its entire blocking network call), while still
+    # paying thread/lock overhead on top. Strictly worse than just being
+    # sequential in the first place, so: sequential, no lock, no mystery.
     mirrors = list(OVERPASS_MIRRORS)
     random.shuffle(mirrors)
     lastErr = None
     for mirror in mirrors:
-        with _overpassSettingsLock:
-            ox.settings.overpass_url = mirror
-            try:
-                return fetchFn(*args)
-            except Exception as e:
-                lastErr = e
-                continue
-    with _overpassSettingsLock:
-        ox.settings.overpass_url = OVERPASS_MIRRORS[0]
+        ox.settings.overpass_url = mirror
+        try:
+            return fetchFn(*args)
+        except Exception as e:
+            lastErr = e
+            continue
+    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     raise RuntimeError(
         f"OpenStreetMap's Overpass data service didn't respond after trying "
         f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
@@ -389,15 +391,6 @@ def _friendlySeries(s):
     useless = s.str.lower().isin(USELESS_CATEGORY_VALUES)
     s = s.mask(useless | (s == ""))
     return s.str.replace("_", " ", regex=False).str.replace("-", " ", regex=False).str.title()
-
-
-def _friendly(value):
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if not value or value.lower() in USELESS_CATEGORY_VALUES:
-        return None
-    return value.replace("_", " ").replace("-", " ").title()
 
 
 def addLabelAndTrim(gdf, layer_key):
@@ -722,7 +715,7 @@ def fetchBuildingsAndFacilities(polygon_wkt):
     # baskets, vending machines, etc -- across the whole campus and is much
     # slower for large campuses like MIT for no benefit, since we filter it
     # right back down below anyway).
-    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {
+    gdf = fetchFromOverpass(_overpassFetch, poly, {
         "building": True,
         "amenity": FACILITY_AMENITY_VALUES,
         "leisure": FACILITY_LEISURE_VALUES,
@@ -914,56 +907,35 @@ def _fetchJob(fn, args, deadline_seconds, label):
     context). Try fn(*args) under a hard deadline; on failure, wait briefly
     and try ONE more time fresh (these fetch functions raise rather than
     cache empty results, so a retry genuinely hits the network again).
-    Returns (result, lastError, didRetry, elapsedSeconds). Elapsed time is
-    measured from inside this worker thread itself, not inferred from when
-    the main thread happens to call .result() -- two jobs running
-    concurrently can finish in either order, and timing them via sequential
-    .result() calls on the main thread would misreport whichever one
-    finishes second as having taken as long as both combined.
+    Returns (result, lastError, didRetry).
     """
-    _t0 = time.time()
     lastErr = None
     for attempt in range(2):
         try:
             result = runWithDeadline(fn, args, deadline_seconds, label)
-            return result, None, attempt > 0, time.time() - _t0
+            return result, None, attempt > 0
         except Exception as e:
             lastErr = e
             if attempt == 0:
                 time.sleep(1)
-    return None, lastErr, True, time.time() - _t0
+    return None, lastErr, True
 
 
 def prepareCampusData(polygon_wkt, active_layers, status):
     from shapely import wkt as swkt
-    import concurrent.futures
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
 
     layerData = {}
 
-    # Back to CONCURRENT fetching -- restoring full speed. The previous
-    # "make it sequential" change was based on an unverified theory about
-    # Overpass's per-IP concurrent-slot limit, and there's no way to confirm
-    # or rule that out without seeing real timing data from an actual slow
-    # run. Instead of trading away speed on a guess, this now times every
-    # stage explicitly and reports it in the status box, so the next slow
-    # run produces hard numbers (which exact stage is slow, and by how much)
-    # instead of more speculation.
-    t0 = time.time()
-    status.update(label="Fetching roads, paths, buildings, and facilities...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        roadFuture = pool.submit(_fetchJob, fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch")
-        buildFuture = pool.submit(_fetchJob, fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch")
-        roadResult, roadErr, roadRetried, roadElapsed = roadFuture.result()
-        buildResult, buildErr, buildRetried, buildElapsed = buildFuture.result()
-
-    status.write(
-        f"⏱️ Roads/paths took {roadElapsed:.1f}s"
-        + (" (needed a retry)" if roadRetried else "")
-        + f" | Buildings/facilities took {buildElapsed:.1f}s"
-        + (" (needed a retry)" if buildRetried else "")
-        + " — both ran concurrently, so wall-clock time is roughly the SLOWER of the two, not the sum."
+    # Fetches run sequentially, not concurrently. Running them concurrently
+    # requires synchronizing access to osmnx's shared global
+    # ox.settings.overpass_url across threads, which added complexity and
+    # overhead without a reliable net speed benefit. Sequential keeps this
+    # simple and correct.
+    status.update(label="Fetching roads and pedestrian paths...")
+    roadResult, roadErr, roadRetried = _fetchJob(
+        fetchRoadsAndWalkways, (polygon_wkt,), 70, "Road/path fetch"
     )
 
     roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
@@ -976,6 +948,11 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
 
+    status.update(label="Fetching buildings and facilities...")
+    buildResult, buildErr, buildRetried = _fetchJob(
+        fetchBuildingsAndFacilities, (polygon_wkt,), 70, "Building fetch"
+    )
+
     bldGdf, facGdf = None, None
     if buildResult is not None:
         bldGdf, facGdf = buildResult
@@ -987,7 +964,6 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
     status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
                  f"Facilities: {len(facGdf) if facGdf is not None else 0}")
-    status.write(f"⏱️ Total data fetch: {time.time() - t0:.1f}s")
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     counts = {}
@@ -1234,31 +1210,6 @@ st.markdown("""
 use_facilities = True
 
 with st.sidebar:
-    st.caption(f"build: {BUILD_MARKER}")
-
-    with st.expander("🔧 Network diagnostic (isolated test)"):
-        st.caption(
-            "This bypasses ALL app logic and makes ONE direct request to "
-            "Nominatim with a 10s timeout. If this hangs or errors, the "
-            "problem is network/deployment-level, not this app's code."
-        )
-        if st.button("Run isolated network test"):
-            diagStart = time.time()
-            try:
-                diagResp = requests.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"q": "MIT", "format": "jsonv2", "limit": 1},
-                    headers={"User-Agent": "campusway-diagnostic/1.0"},
-                    timeout=10,
-                )
-                diagElapsed = time.time() - diagStart
-                st.success(f"HTTP {diagResp.status_code} in {diagElapsed:.1f}s")
-                st.json(diagResp.json()[:1] if diagResp.ok else diagResp.text[:500])
-            except Exception as e:
-                diagElapsed = time.time() - diagStart
-                st.error(f"FAILED after {diagElapsed:.1f}s: {type(e).__name__}: {e}")
-
-    st.divider()
     st.subheader("Search")
     campusInput = st.text_input(
         "University or college name",
@@ -1375,14 +1326,11 @@ if not searchTerm:
 
 if "campusData" not in st.session_state:
     err = None
-    _searchStartTime = time.time()
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            _geoStart = time.time()
             campusName, campusPoly = runWithDeadline(findCampus, (searchTerm,), 60, "Campus lookup")
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
-            status.write(f"⏱️ Geocoding took {time.time() - _geoStart:.1f}s")
         except TimeoutError as e:
             status.update(label="Timed out", state="error")
             err = ("error", str(e))
@@ -1410,7 +1358,6 @@ if "campusData" not in st.session_state:
                 st.session_state["namedLocations"] = namedLocations
                 st.session_state["namedRoads"] = namedRoads
                 st.session_state["namedRoadGeo"] = namedRoadGeo
-                status.write(f"⏱️ **Grand total, click to map ready: {time.time() - _searchStartTime:.1f}s**")
                 status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
             except ValueError as e:
                 status.update(label="Couldn't build the map", state="error")
