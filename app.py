@@ -21,10 +21,10 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
+BUILD_LABEL = "v2.6"
 
-MAX_FEATURES_PER_LAYER = 2500  # lower = less data to transfer, process, and render; still generous for any real campus
+MAX_FEATURES_PER_LAYER = 2500
 
-# ── CARTO basemap tile URL with API key (removes watermark) ──────────────────
 CARTO_KEY = "cb1_2ely_1_56403dce0becb94f8ac75d76"
 CARTO_TILE_URL = (
     f"https://{{s}}.basemaps.cartocdn.com/rastertiles/light_all/{{z}}/{{x}}/{{y}}.png"
@@ -35,7 +35,6 @@ CARTO_ATTRIBUTION = (
     '&copy; <a href="https://carto.com/attributions">CARTO</a>'
 )
 
-
 def _capFeatures(gdf, maxRows=MAX_FEATURES_PER_LAYER):
     if gdf is None or len(gdf) <= maxRows:
         return gdf
@@ -44,21 +43,6 @@ def _capFeatures(gdf, maxRows=MAX_FEATURES_PER_LAYER):
         return gdf.loc[areas.sort_values(ascending=False).index[:maxRows]]
     except Exception:
         return gdf.iloc[:maxRows]
-
-
-def getIds(gdf):
-    if gdf is None or gdf.empty:
-        return set()
-    try:
-        if isinstance(gdf.index, pd.MultiIndex):
-            if "osmid" in (gdf.index.names or []):
-                return set(gdf.index.get_level_values("osmid"))
-            return set(x[-1] if isinstance(x, tuple) else x for x in gdf.index)
-        if "osmid" in gdf.columns:
-            return set(gdf["osmid"])
-    except Exception:
-        pass
-    return set()
 
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -76,15 +60,18 @@ layer_labels = {
 }
 
 def styleFor(color, fill, opacity, weight, dashed=False):
-    s = {"color": color, "fillColor": fill, "fillOpacity": opacity, "weight": weight, "opacity": 0.9}
+    s = {
+        "color": color, "fillColor": fill, "fillOpacity": opacity, "weight": weight,
+        "opacity": 0.9, "lineCap": "round", "lineJoin": "round",
+    }
     if dashed:
         s["dashArray"] = "6, 6"
     return lambda feat: s
 
 campusStyles = {
-    "buildings":  styleFor("#3A6EA5", "#3A6EA5", 0.45, 1.0),
-    "walkways":   styleFor("#1F6F54", "#1F6F54", 0.0,  2.5, dashed=True),
-    "roads":      styleFor("#726B5E", "#726B5E", 0.0,  1.5),
+    "buildings":  styleFor("#3A6EA5", "#3A6EA5", 0.5,  1.2),
+    "walkways":   styleFor("#1F6F54", "#1F6F54", 0.0,  2.75, dashed=True),
+    "roads":      styleFor("#726B5E", "#726B5E", 0.0,  2.0),
     "facilities": styleFor("#A02B5C", "#A02B5C", 0.7,  1.5),
 }
 
@@ -98,24 +85,8 @@ LAYER_COLORS = {
 req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
 RATE_LIMIT_GAP = 1.5
 
-
 def runWithDeadline(fn, args, seconds, label):
-    """
-    Run fn(*args) in a background thread and give up after `seconds`,
-    regardless of what fn is actually doing (blocked socket read, DNS
-    resolution hang, a dependency ignoring its own timeout, etc).
-
-    IMPORTANT: this deliberately does NOT use ThreadPoolExecutor as a
-    `with` block. `with ThreadPoolExecutor() as pool:` calls
-    pool.shutdown(wait=True) on exit -- which BLOCKS until the background
-    thread actually finishes, even if future.result(timeout=...) already
-    raised. That silently defeated the entire point of a deadline: the
-    caller would still hang for however long the real call took, just
-    with an extra exception swallowed at the end. Calling shutdown(wait=False)
-    explicitly lets the calling thread return immediately once the deadline
-    hits; the orphaned worker thread finishes on its own and its result
-    (or exception) is simply discarded.
-    """
+    """runs fn in a thread, bails after seconds no matter what"""
     import concurrent.futures
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = pool.submit(fn, *args)
@@ -124,7 +95,7 @@ def runWithDeadline(fn, args, seconds, label):
         pool.shutdown(wait=False)
         return result
     except concurrent.futures.TimeoutError:
-        pool.shutdown(wait=False)  # do NOT wait -- this is the actual fix
+        pool.shutdown(wait=False)
         raise TimeoutError(
             f"{label} took longer than {seconds}s and was cancelled. "
             f"OpenStreetMap's free services can be slow or unreachable "
@@ -134,72 +105,22 @@ def runWithDeadline(fn, args, seconds, label):
         pool.shutdown(wait=False)
         raise
 
-
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api",
     "https://overpass.kumi.systems/api",
     "https://overpass.private.coffee/api",
 ]
 
-
 @st.cache_resource
 def initOsmnx():
-    # OSMnx's own on-disk HTTP cache is redundant here: fetchCampusFeatures
-    # is already st.cache_data-cached for 24h at a higher level. Leaving
-    # OSMnx's disk cache on means every fresh
-    # request also pays disk I/O for a cache layer that adds no benefit on
-    # top of the one we already have -- pure overhead.
     ox.settings.use_cache = False
     ox.settings.log_console = False
-    # CRITICAL: requests_timeout is not just how long *we* wait for a
-    # response -- OSMnx injects it directly into the Overpass query as
-    # "[timeout:N]", which tells the OVERPASS SERVER how many seconds of
-    # actual query-execution time it's allowed before self-aborting.
-    # Confirmed directly against OSMnx's own docs: its own default is 180s.
-    # A previous change set this to 13s while chasing a since-disproven
-    # "mirror cycling" theory -- meaning EVERY query, even for a tiny campus,
-    # was being told to give up after 13s of real server-side work,
-    # regardless of network conditions or which mirror it hit. That is very
-    # likely the actual cause of every fresh campus being slow or failing
-    # outright (Deep Springs College erroring after 2 minutes): not bad luck
-    # or overload, but us telling the server to abort before it could ever
-    # realistically finish. 60s gives real breathing room for a normal
-    # campus query without going all the way to OSMnx's own 180s default.
     ox.settings.requests_timeout = 60
-    # Confirmed against OSMnx docs: overpass_rate_limit (default True) makes
-    # OSMnx check the Overpass /status endpoint -- a full extra HTTP
-    # round-trip -- before EVERY query, purely to decide whether to
-    # pre-emptively sleep. We already have our own timeout, retry, and
-    # mirror-cycling logic as a safety net, so this adds latency to every
-    # single request with no real benefit here.
     ox.settings.overpass_rate_limit = False
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
-
 def fetchFromOverpass(fetchFn, *args):
-    # No _status param: called from inside st.cache_data functions where
-    # writing to Streamlit widgets is forbidden and causes the cached-replay crash.
-    # Try each mirror ONCE -- no retry-with-sleep here. Retrying each mirror
-    # multiple times with long timeouts previously multiplied worst-case wait
-    # to several minutes per call, which is indistinguishable from "stuck" to
-    # a user. The hard deadline in runWithDeadline() is the real safety net.
-    #
-    # Mirrors are shuffled per call (not always starting at mirrors[0]) so a
-    # temporarily overloaded "first" mirror doesn't get hit first on every
-    # single request from every user -- spreads load, improves the odds any
-    # given call lands on a healthy mirror immediately.
-    #
-    # NOTE: fetchCampusFeatures now does ONE combined Overpass call per
-    # search (see prepareCampusData) -- there's no second concurrent fetch
-    # to race with, so only one thread ever touches the shared
-    # ox.settings.overpass_url global at a time and no lock is needed. An
-    # earlier version ran roads and buildings as two separate concurrent
-    # fetches and added a lock here to stop them stomping on each other's
-    # mirror selection -- but that lock ended up serializing the two fetches
-    # anyway (one held it for its entire blocking network call), while still
-    # paying thread/lock overhead on top. Merging them into one call removed
-    # the problem at its root instead of managing around it.
     mirrors = list(OVERPASS_MIRRORS)
     random.shuffle(mirrors)
     lastErr = None
@@ -219,31 +140,19 @@ def fetchFromOverpass(fetchFn, *args):
     )
 
 
+
 _nomLastCallTime = [0.0]
 _nomLock = threading.Lock()
 
 def throttleNominatim():
-    # Plain module-level state, NOT st.session_state: this function is called
-    # from inside a background thread (see runWithDeadline), and st.session_state
-    # requires Streamlit's script-run context which only exists on the main
-    # thread. Using session_state here was silently unreliable across threads.
     with _nomLock:
         gap = RATE_LIMIT_GAP - (time.monotonic() - _nomLastCallTime[0])
         if gap > 0:
             time.sleep(gap)
         _nomLastCallTime[0] = time.monotonic()
 
-
 initOsmnx()
 
-# ── campus detection ─────────────────────────────────────────────────────────
-# NOT_CAMPUS previously included "boundary" -- but university campuses are
-# frequently mapped in OSM as boundary relations (type=boundary,
-# boundary=administrative or boundary=place), so that exclusion was silently
-# rejecting real campuses like MIT, Caltech, and many others that happen to
-# be stored as relation boundaries rather than amenity polygons in OSM.
-# Removed "boundary" from the hard-exclusion set; the positive EDU_TAG_PAIRS
-# and campusNameHints checks already handle the real filtering correctly.
 NOT_CAMPUS = {"leisure", "shop", "tourism", "highway", "natural"}
 
 EDU_TAG_PAIRS = {
@@ -252,8 +161,8 @@ EDU_TAG_PAIRS = {
     ("amenity", "school"),
     ("amenity", "research_institute"),
     ("landuse", "education"),
-    ("boundary", "educational"),    # additional OSM tagging pattern used for
-    ("place", "campus"),            # many large US/UK/AU research campuses
+    ("boundary", "educational"),
+    ("place", "campus"),
 }
 
 campusNameHints = (
@@ -265,27 +174,19 @@ campusNameHints = (
     "ecole",
     "universidad",
     "universita",
-    "mit",          # well-known acronyms that don't contain a hint word
+    "mit",
     "caltech",
     "mit.edu",
 )
 
-# "mit" (and to a lesser extent a few other short hints) is a substring of
-# many unrelated words -- "Admit", "Committee", "Summit", "Marriott" would
-# all incorrectly match with a plain "in" check. Word-boundary regexes make
-# these only match whole words/phrases instead of anywhere inside a word.
 _campusNameHintPatterns = [
     re.compile(r"\b" + re.escape(h) + r"\b", re.IGNORECASE) for h in campusNameHints
 ]
-
 
 def looksLikeCampus(nominatimResult):
     pair = (nominatimResult.get("class"), nominatimResult.get("type"))
     if pair in EDU_TAG_PAIRS:
         return True
-    # Hard-exclusion: classes that are unambiguously NOT a campus no matter
-    # what their display name says (a shop named "University Bookstore" should
-    # not be treated as a campus result).
     if nominatimResult.get("class") in NOT_CAMPUS:
         return False
     dn = nominatimResult.get("display_name") or ""
@@ -293,9 +194,7 @@ def looksLikeCampus(nominatimResult):
         dn = str(dn)
     return any(p.search(dn) for p in _campusNameHintPatterns)
 
-
 PHOTON_URL = "https://photon.komoot.io/api/"
-
 
 def queryPhoton(q, limit=5):
     p = {"q": q, "limit": limit}
@@ -312,13 +211,6 @@ def queryPhoton(q, limit=5):
         parts = [name, props.get("city"), props.get("state"), props.get("country")]
         display_name = ", ".join(x for x in parts if x)
 
-        # NOTE: deliberately NOT parsing a boundingbox from Photon's "extent"
-        # field. Its exact coordinate order isn't confirmed against an
-        # authoritative source, and a wrong order would silently produce an
-        # inverted/garbage box -- exactly the class of bug that's caused
-        # real problems in this app before. lat/lon are always present and
-        # unambiguous; findCampus already has a verified-correct fallback
-        # that pads a box around a bare point when no boundingbox exists.
         out.append({
             "class": props.get("osm_key"),
             "type": props.get("osm_value"),
@@ -331,7 +223,6 @@ def queryPhoton(q, limit=5):
             "lon": coords[0] if coords else None,
         })
     return out
-
 
 def queryNominatim(q, limit=5):
     p = {
@@ -379,7 +270,6 @@ def queryNominatim(q, limit=5):
         f"Raw response: `{lastBody or '(empty)'}`"
     )
 
-
 FALLBACK_TAG = {
     "buildings":  ("building", "Building"),
     "facilities": ("amenity", "Facility"),
@@ -387,8 +277,8 @@ FALLBACK_TAG = {
     "roads":      ("highway", "Road"),
 }
 
-
 USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
+
 
 
 def _friendlySeries(s):
@@ -398,7 +288,6 @@ def _friendlySeries(s):
     useless = s.str.lower().isin(USELESS_CATEGORY_VALUES)
     s = s.mask(useless | (s == ""))
     return s.str.replace("_", " ", regex=False).str.replace("-", " ", regex=False).str.title()
-
 
 def addLabelAndTrim(gdf, layer_key):
     if gdf is None or gdf.empty:
@@ -432,6 +321,7 @@ def addLabelAndTrim(gdf, layer_key):
         return gdf
 
 
+
 SIMPLIFY_TOLERANCE = 0.00005
 
 
@@ -445,16 +335,12 @@ def _simplify(gdf):
     except Exception:
         return gdf
 
-
-def makeTooltip():
-    return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
-
-
 def _mergeBounds(existing, south, west, north, east):
     if existing is None:
         return (south, west, north, east)
     es, ew, en, ee = existing
     return (min(es, south), min(ew, west), max(en, north), max(ee, east))
+
 
 
 def _haversineMeters(lat1, lon1, lat2, lon2):
@@ -499,7 +385,6 @@ def _editDistance(a, b):
         prev = cur
     return prev[lb]
 
-
 def _fuzzyScore(query, candidate):
     q = query.lower().strip()
     c = candidate.lower()
@@ -515,13 +400,39 @@ def _fuzzyScore(query, candidate):
         return 0
     return 500 - best * 40
 
-
 def fuzzySearch(query, names, limit=6, minScore=1):
     scored = [(n, _fuzzyScore(query, n)) for n in names]
     scored = [t for t in scored if t[1] >= minScore]
     scored.sort(key=lambda t: -t[1])
     return [n for n, _ in scored[:limit]]
 
+
+def _quickSearchBody(namedLocs, namedRds):
+    quickQuery = st.text_input(
+        "Quick search (handles typos)",
+        key="quick_search",
+        placeholder='e.g. "libary" or "quad"',
+    )
+    if quickQuery.strip():
+        allNames = {n: "building" for n in namedLocs}
+        allNames.update({n: "road" for n in namedRds})
+        matches = fuzzySearch(quickQuery, list(allNames.keys()))
+        if matches:
+            for m in matches:
+                kind = allNames[m]
+                icon = "🏢" if kind == "building" else "🛣️"
+                if st.button(f"{icon} {m}", key=f"quick_pick_{kind}_{m}", use_container_width=True):
+                    if kind == "building":
+                        st.session_state["building_select"] = m
+                        st.session_state["road_select"] = None
+                    else:
+                        st.session_state["road_select"] = m
+                        st.session_state["building_select"] = None
+                    st.rerun()
+        else:
+            st.caption("No matches -- try a different spelling.")
+
+quickSearchWidget = st.fragment(_quickSearchBody) if hasattr(st, "fragment") else _quickSearchBody
 
 def _geomBounds(geometry):
     if not geometry:
@@ -545,6 +456,7 @@ def _geomBounds(geometry):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+
 def _roundGeoJson(geo, precision=5):
     if not geo:
         return geo
@@ -561,7 +473,6 @@ def _roundGeoJson(geo, precision=5):
         if geom and geom.get("coordinates") is not None:
             geom["coordinates"] = _round(geom["coordinates"])
     return geo
-
 
 def _stripUnusedProps(geo, keep=("Label",)):
     if not geo:
@@ -624,57 +535,24 @@ def _propagateRoadNames(features, maxHops=6):
 
 
 def _overpassFetch(poly, tags):
-    """
-    Route to the cheapest Overpass query available for this geometry.
-    features_from_polygon requires Overpass to do point-in-polygon clipping
-    against every candidate element server-side -- meaningfully more
-    expensive than a plain coordinate-range filter. Many of our campus
-    boundaries ARE already simple axis-aligned rectangles (the bbox
-    fallback path, and the padded-point fallback both produce boxes) --
-    for those, features_from_bbox returns the identical result set for
-    less server-side work. A tolerance-based check (poly is very close to
-    its own envelope) catches these without needing to track a flag through
-    every caller.
-
-    For real, non-rectangular boundaries (actual Nominatim campus polygons),
-    the server-side clipping cost scales with how many VERTICES the query
-    polygon has, not just its area -- a detailed real-world campus boundary
-    can have hundreds of vertices. We already simplify the RESULT geometries
-    after fetching (_simplify), but were sending the full-detail QUERY
-    polygon on every request, paying that vertex-count cost for no benefit:
-    ~15m of boundary precision is imperceptible at the scale of "does this
-    building count as on-campus" and meaningfully cuts vertex count for a
-    highly detailed shape.
-    """
-    QUERY_SIMPLIFY_TOLERANCE = 0.0003  # ~30m at mid-latitudes
+    """picks bbox query vs polygon query, whichever is cheaper"""
+    QUERY_SIMPLIFY_TOLERANCE = 0.0003
     try:
         simplified = poly.simplify(QUERY_SIMPLIFY_TOLERANCE, preserve_topology=True)
         if not simplified.is_empty and simplified.is_valid:
             poly = simplified
     except Exception:
-        pass  # fall through and query with the original polygon
+        pass
 
     is_rectangle = poly.equals_exact(poly.envelope, tolerance=1e-9) or \
         poly.symmetric_difference(poly.envelope).area < (poly.area * 0.001)
     if is_rectangle:
         west, south, east, north = poly.bounds
-        # OSMnx 2.x bbox order is (left, bottom, right, top) i.e. (west, south, east, north).
         return ox.features_from_bbox((west, south, east, north), tags)
     return ox.features_from_polygon(poly, tags)
 
-
 def fetchCampusFeatures(polygon_wkt):
-    """
-    Single combined Overpass query for roads, walkways, buildings, AND
-    facilities together -- replaces what used to be two separate sequential
-    fetchRoadsAndWalkways / fetchBuildingsAndFacilities calls. Halves the
-    number of HTTP round-trips per campus search, and Overpass only has to
-    compute the polygon's spatial index once instead of twice. Everything
-    downstream (per-category feature capping, labeling, named-road
-    propagation) is preserved exactly as it was in the two separate
-    functions -- just applied to subsets split out of one combined result
-    instead of two independently-fetched ones.
-    """
+    """one combined overpass call for everything"""
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
@@ -686,14 +564,11 @@ def fetchCampusFeatures(polygon_wkt):
         "leisure": FACILITY_LEISURE_VALUES,
     })
     if gdf is None or gdf.empty:
-        # See the old fetchRoadsAndWalkways for why this raises instead of
-        # returning an empty result -- avoids permanently caching a
-        # transient failure as "this campus has no data" for 24h.
         raise RuntimeError(
             "Overpass returned no data for this area (possibly transient)"
         )
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-    gdf = _simplify(gdf)  # single shared tolerance, same as before -- safe to do once on the combined set
+    gdf = _simplify(gdf)
 
     has_highway = gdf["highway"].isin(allowedHighways) if "highway" in gdf.columns else pd.Series(False, index=gdf.index)
     has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
@@ -705,10 +580,6 @@ def fetchCampusFeatures(polygon_wkt):
     buildings = gdf[has_building].copy()
     facilities = gdf[has_amenity | has_leisure].copy()
 
-    # Cap PER CATEGORY separately, exactly as the two old functions did --
-    # capping the combined whole instead would let one category (e.g. a
-    # huge count of buildings) crowd out another (e.g. roads) in a way the
-    # app never used to behave.
     walkways = _capFeatures(walkways)
     roads = _capFeatures(roads)
     buildings = _capFeatures(buildings)
@@ -755,6 +626,22 @@ def fetchCampusFeatures(polygon_wkt):
 fetchCampusFeatures = st.cache_data(show_spinner=False, ttl="24h")(fetchCampusFeatures)
 
 
+
+def getIds(gdf):
+    if gdf is None or gdf.empty:
+        return set()
+    try:
+        if isinstance(gdf.index, pd.MultiIndex):
+            if "osmid" in (gdf.index.names or []):
+                return set(gdf.index.get_level_values("osmid"))
+            return set(x[-1] if isinstance(x, tuple) else x for x in gdf.index)
+        if "osmid" in gdf.columns:
+            return set(gdf["osmid"])
+    except Exception:
+        pass
+    return set()
+
+
 def stripDuplicateBuildings(buildingsDf, facilitiesDf):
     if buildingsDf is None or buildingsDf.empty:
         return buildingsDf
@@ -777,13 +664,13 @@ def stripDuplicateBuildings(buildingsDf, facilitiesDf):
     except Exception:
         return buildingsDf
 
-
 def _alternateNameGuess(name):
     m = re.match(r'^(university|college)\s+of\s+(.+)$', name.strip(), re.IGNORECASE)
     if not m:
         return None
     kind, rest = m.groups()
     return f"{rest.strip()} {kind.title()}"
+
 
 
 def findCampus(name):
@@ -815,10 +702,6 @@ def findCampus(name):
                 pass
 
     if not edu_hits:
-        # Last-ditch: if the query itself contains an education keyword but
-        # none of the Nominatim results matched our classifier, accept the
-        # top result anyway rather than showing a hard failure -- the user
-        # knows what they searched for.
         name_lower = name.lower()
         query_looks_educational = any(p.search(name_lower) for p in _campusNameHintPatterns)
         if query_looks_educational and results:
@@ -845,12 +728,6 @@ def findCampus(name):
         except Exception:
             continue
 
-    # No hit had a usable polygon. Before falling back to a raw bounding box,
-    # prefer a "relation" or "way" hit over a bare "node" (point) -- a node's
-    # Nominatim bbox is tiny (tens of meters), which for a real campus almost
-    # always misses every actual building/road, silently producing "no data"
-    # even though OSM has plenty of data for the school. Prefer whichever hit
-    # has the largest bbox area as a proxy for "most likely a real boundary".
     def _bboxArea(hit):
         bbox = hit.get("boundingbox")
         if not bbox or len(bbox) != 4:
@@ -869,16 +746,12 @@ def findCampus(name):
     top_hit = ranked[0]
     hitName = top_hit.get("display_name", name)
 
-    MIN_SPAN_DEG = 0.0018  # ~200m at mid latitudes, so ~400m box
+    MIN_SPAN_DEG = 0.0018
 
     bbox = top_hit.get("boundingbox")
     if bbox and len(bbox) == 4:
         try:
             south, north, west, east = (float(v) for v in bbox)
-            # A bare node's bbox is a tiny square around one point -- pad it
-            # out to a sane minimum footprint (roughly 400m x 400m) so the
-            # Overpass query has a real chance of catching nearby campus
-            # buildings/roads instead of guaranteed-empty results.
             if (north - south) < MIN_SPAN_DEG or (east - west) < MIN_SPAN_DEG:
                 cy, cx = (north + south) / 2, (east + west) / 2
                 south, north = cy - MIN_SPAN_DEG, cy + MIN_SPAN_DEG
@@ -888,12 +761,6 @@ def findCampus(name):
         except Exception:
             pass
 
-    # No boundingbox at all -- this is always the case for Photon-sourced
-    # results now (queryPhoton deliberately never parses a boundingbox from
-    # Photon's "extent" field -- its exact coordinate order couldn't be
-    # confirmed against an authoritative source, so we don't risk silently
-    # using a wrong/inverted box). Photon and Nominatim both always provide
-    # lat/lon though, so build a padded box around the point instead.
     lat, lon = top_hit.get("lat"), top_hit.get("lon")
     if lat is not None and lon is not None:
         try:
@@ -911,16 +778,8 @@ def findCampus(name):
     )
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
-
 def _fetchJob(fn, args, deadline_seconds, label):
-    """
-    Pure data function, NO Streamlit calls -- safe to run inside a worker
-    thread (unlike status.write, which needs the main-thread script-run
-    context). Try fn(*args) under a hard deadline; on failure, wait briefly
-    and try ONE more time fresh (these fetch functions raise rather than
-    cache empty results, so a retry genuinely hits the network again).
-    Returns (result, lastError, didRetry).
-    """
+    """returns (result, err, didRetry)"""
     lastErr = None
     for attempt in range(2):
         try:
@@ -940,10 +799,6 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     layerData = {}
 
-    # ONE combined Overpass query for roads, walkways, buildings, AND
-    # facilities together -- previously two separate sequential fetches.
-    # This halves the number of HTTP round-trips per search and lets
-    # Overpass compute the polygon's spatial index once instead of twice.
     status.update(label="Fetching campus data...")
     result, fetchErr, wasRetried = _fetchJob(
         fetchCampusFeatures, (polygon_wkt,), 70, "Campus data fetch"
@@ -1035,6 +890,8 @@ def addBranding(m):
     branding._template = Template(branding_html)
     m.get_root().add_child(branding)
 
+def makeTooltip():
+    return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
 
 def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, focusLoc=None,
                      focusRoad=None, focusRoadBounds=None, focusRoadGeo=None):
@@ -1042,14 +899,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
     cLat = (miny + maxy) / 2
     cLon = (minx + maxx) / 2
 
-    # Use explicit CARTO tile URL with API key instead of the named alias so
-    # the key parameter is included and the "API key required" watermark is
-    # removed. CartoDB.Positron (light_all) is visually identical to what the
-    # app used before -- the only change is the key in the URL.
     m = leafmap.Map(
         center=[cLat, cLon],
         zoom=15,
-        tiles=None,          # disable the default tile layer; we add ours below
+        tiles=None,
         prefer_canvas=True,
         control_scale=True,
     )
@@ -1078,7 +931,25 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         position="topleft",
         primary_length_unit="meters",
         secondary_length_unit="feet",
+        active_color="#C54C0A",
+        completed_color="#E8823D",
     ).add_to(m)
+
+    measurePanFix = MacroElement()
+    measurePanFix._template = Template("""
+    {% macro script(this, kwargs) %}
+    (function() {
+        var mapObj = {{ this._parent.get_name() }};
+        function keepDraggingEnabled() {
+            if (mapObj && mapObj.dragging && !mapObj.dragging.enabled()) {
+                mapObj.dragging.enable();
+            }
+        }
+        setInterval(keepDraggingEnabled, 150);
+    })();
+    {% endmacro %}
+    """)
+    m.add_child(measurePanFix)
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     for k in drawOrder:
@@ -1155,8 +1026,6 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
 
     return m
 
-
-# ── visual identity ──────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&family=IBM+Plex+Mono:wght@500&display=swap');
@@ -1201,11 +1070,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── sidebar ──────────────────────────────────────────────────────────────────
-
 use_facilities = True
 
 with st.sidebar:
+    st.caption(BUILD_LABEL)
     st.subheader("Search")
     campusInput = st.text_input(
         "University or college name",
@@ -1253,28 +1121,7 @@ with st.sidebar:
         st.divider()
         st.subheader("Navigate")
 
-        quickQuery = st.text_input(
-            "Quick search (handles typos)",
-            key="quick_search",
-            placeholder='e.g. "libary" or "quad"',
-        )
-        if quickQuery.strip():
-            allNames = {n: "building" for n in namedLocs}
-            allNames.update({n: "road" for n in namedRds})
-            matches = fuzzySearch(quickQuery, list(allNames.keys()))
-            if matches:
-                for m in matches:
-                    kind = allNames[m]
-                    icon = "🏢" if kind == "building" else "🛣️"
-                    if st.button(f"{icon} {m}", key=f"quick_pick_{kind}_{m}", use_container_width=True):
-                        if kind == "building":
-                            st.session_state["building_select"] = m
-                            st.session_state["road_select"] = None
-                        else:
-                            st.session_state["road_select"] = m
-                            st.session_state["building_select"] = None
-            else:
-                st.caption("No matches -- try a different spelling.")
+        quickSearchWidget(namedLocs, namedRds)
 
         st.caption("Or browse the full list:")
 
@@ -1302,8 +1149,6 @@ with st.sidebar:
             if selectedRoad:
                 focusRoad = selectedRoad
 
-
-# ── main area ─────────────────────────────────────────────────────────────────
 
 if searchBtn and campusInput.strip():
     newSearch = campusInput.strip()
