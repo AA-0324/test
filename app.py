@@ -1,27 +1,28 @@
-import streamlit as st
-
-st.set_page_config(
-    layout="wide",
-    initial_sidebar_state="expanded",
-    page_title="CampusWay",
-    page_icon="🧭",
-)
-
 import time
 import re
 import threading
 import random
 import math
 import concurrent.futures
-import requests
 from collections import deque
+
+import requests
 import pandas as pd
+import streamlit as st
 import folium
-from branca.element import MacroElement, Template
-from shapely.geometry import shape, box as shapelyBox
-from folium import plugins as folium_plugins
-import leafmap.foliumap as leafmap
 import osmnx as ox
+import leafmap.foliumap as leafmap
+from branca.element import MacroElement, Template
+from folium import plugins as folium_plugins
+from shapely.geometry import shape, box as shapelyBox
+
+# must come before any other st call
+st.set_page_config(
+    layout="wide",
+    initial_sidebar_state="expanded",
+    page_title="CampusWay",
+    page_icon="🧭",
+)
 
 BUILD_LABEL = "v2.6"
 
@@ -43,6 +44,7 @@ PHOTON_URL = "https://photon.komoot.io/api/"
 req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
 RATE_LIMIT_GAP = 1.5
 
+# public overpass servers get overloaded, so we try them in random order
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api",
     "https://overpass.kumi.systems/api",
@@ -83,7 +85,7 @@ EDU_TAG_PAIRS = {
     ("place", "campus"),
 }
 
-campusNameHints = (
+campus_name_hints = (
     "university",
     "college",
     "institute of technology",
@@ -98,7 +100,7 @@ campusNameHints = (
 )
 
 _campusNameHintPatterns = [
-    re.compile(r"\b" + re.escape(h) + r"\b", re.IGNORECASE) for h in campusNameHints
+    re.compile(r"\b" + re.escape(h) + r"\b", re.IGNORECASE) for h in campus_name_hints
 ]
 
 FALLBACK_TAG = {
@@ -111,6 +113,7 @@ FALLBACK_TAG = {
 USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
 
 _nomLastCallTime = [0.0]
+# nominatim wants roughly one request per second
 _nomLock = threading.Lock()
 
 
@@ -143,8 +146,7 @@ def cap_features(gdf, maxRows=None):
         return gdf.iloc[:maxRows]
 
 
-def runWithDeadline(fn, args, seconds, label):
-    """runs fn in a thread, bails after seconds no matter what"""
+def run_with_deadline(fn, args, seconds, label):
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = pool.submit(fn, *args)
     try:
@@ -475,10 +477,10 @@ def _haversineMeters(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def nearbyLocations(focusLoc, focusName, allLocs, maxResults=4, maxMeters=300):
-    if not focusLoc:
+def nearbyLocations(focus_loc, focusName, allLocs, maxResults=4, maxMeters=300):
+    if not focus_loc:
         return []
-    flat, flon = focusLoc
+    flat, flon = focus_loc
     out = []
     for name, (lat, lon) in allLocs.items():
         if name == focusName:
@@ -557,6 +559,7 @@ def _quickSearchBody(namedLocs, namedRds):
             st.caption("No matches -- try a different spelling.")
 
 
+# fragments need a newer streamlit, so fall back to a plain function on older installs
 quickSearchWidget = st.fragment(_quickSearchBody) if hasattr(st, "fragment") else _quickSearchBody
 
 
@@ -661,7 +664,6 @@ def _propagateRoadNames(features, maxHops=6):
 
 
 def _overpassFetch(poly, tags):
-    """picks bbox query vs polygon query, whichever is cheaper"""
     query_tol = 0.0003
     try:
         simplified = poly.simplify(query_tol, preserve_topology=True)
@@ -679,7 +681,6 @@ def _overpassFetch(poly, tags):
 
 
 def fetchCampusFeatures(polygon_wkt):
-    """one combined overpass call for everything"""
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
@@ -794,11 +795,10 @@ def stripDuplicateBuildings(buildingsDf, facilitiesDf):
 
 
 def _fetchJob(fn, args, deadline_seconds, label):
-    """returns (result, err, didRetry)"""
     lastErr = None
     for attempt in range(2):
         try:
-            result = runWithDeadline(fn, args, deadline_seconds, label)
+            result = run_with_deadline(fn, args, deadline_seconds, label)
             return result, None, attempt > 0
         except Exception as e:
             lastErr = e
@@ -812,7 +812,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
 
-    layerData = {}
+    layer_data = {}
 
     status.update(label="Fetching campus data...")
     result, fetchErr, wasRetried = _fetchJob(
@@ -827,12 +827,12 @@ def prepareCampusData(polygon_wkt, active_layers, status):
                      f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
     else:
         status.write(f"⚠️ Campus data unavailable after retry ({fetchErr}).")
-    layerData["roads"] = roadGeo
-    layerData["walkways"] = walkGeo
+    layer_data["roads"] = roadGeo
+    layer_data["walkways"] = walkGeo
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
-    layerData["buildings"] = _stripUnusedProps(round_geojson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
-    layerData["facilities"] = _stripUnusedProps(round_geojson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
+    layer_data["buildings"] = _stripUnusedProps(round_geojson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
+    layer_data["facilities"] = _stripUnusedProps(round_geojson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
     status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
                  f"Facilities: {len(facGdf) if facGdf is not None else 0}")
 
@@ -840,9 +840,9 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     counts = {}
     foundAnything = False
     for k in drawOrder:
-        if k not in layerData:
+        if k not in layer_data:
             continue
-        geo = layerData[k]
+        geo = layer_data[k]
         if not geo or not geo.get("features"):
             counts[k] = 0
             continue
@@ -886,7 +886,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
                 continue
 
     bounds = (miny, minx, maxy, maxx)
-    return layerData, counts, namedLocations, namedRoads, namedRoadGeo, bounds
+    return layer_data, counts, namedLocations, namedRoads, namedRoadGeo, bounds
 
 
 def addBranding(m):
@@ -910,7 +910,7 @@ def makeTooltip():
     return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
 
 
-def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, focusLoc=None,
+def renderCampusMap(layer_data, counts, bounds, visibleLayers, focusName=None, focus_loc=None,
                      focusRoad=None, focusRoadBounds=None, focusRoadGeo=None):
     miny, minx, maxy, maxx = bounds
     cLat = (miny + maxy) / 2
@@ -972,7 +972,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
     for k in drawOrder:
         if k not in visibleLayers:
             continue
-        geo = layerData.get(k)
+        geo = layer_data.get(k)
         if not geo or not geo.get("features"):
             continue
         folium.GeoJson(
@@ -1008,8 +1008,8 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
 
     addBranding(m)
 
-    if focusName and focusLoc:
-        flat, flon = focusLoc
+    if focusName and focus_loc:
+        flat, flon = focus_loc
         pad = 0.0012
         m.fit_bounds([[flat - pad, flon - pad], [flat + pad, flon + pad]])
         folium.CircleMarker(
@@ -1190,7 +1190,7 @@ if "campusData" not in st.session_state:
     err = None
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            campusName, campusPoly = runWithDeadline(findCampus, (searchTerm,), 60, "Campus lookup")
+            campusName, campusPoly = run_with_deadline(findCampus, (searchTerm,), 60, "Campus lookup")
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
         except TimeoutError as e:
@@ -1209,10 +1209,10 @@ if "campusData" not in st.session_state:
 
         if err is None:
             try:
-                layerData, layerCounts, namedLocations, namedRoads, namedRoadGeo, bounds = \
+                layer_data, layerCounts, namedLocations, namedRoads, namedRoadGeo, bounds = \
                     prepareCampusData(campusPoly, active_layers, status)
                 st.session_state["campusData"] = {
-                    "layerData": layerData,
+                    "layerData": layer_data,
                     "counts": layerCounts,
                     "bounds": bounds,
                     "campusName": campusName,
@@ -1240,9 +1240,9 @@ if "campusData" not in st.session_state:
 
 campusData = st.session_state["campusData"]
 
-focusLoc = None
+focus_loc = None
 if focusName and focusName in st.session_state.get("namedLocations", {}):
-    focusLoc = st.session_state["namedLocations"][focusName]
+    focus_loc = st.session_state["namedLocations"][focusName]
 else:
     focusName = None
 
@@ -1260,7 +1260,7 @@ campusMap = renderCampusMap(
     campusData["bounds"],
     visibleLayers=set(active_layers),
     focusName=focusName,
-    focusLoc=focusLoc,
+    focus_loc=focus_loc,
     focusRoad=focusRoad,
     focusRoadBounds=focusRoadBounds,
     focusRoadGeo=focusRoadGeo,
@@ -1268,8 +1268,8 @@ campusMap = renderCampusMap(
 
 campusMap.to_streamlit(height=620)
 
-if focusName and focusLoc:
-    nearby = nearbyLocations(focusLoc, focusName, st.session_state.get("namedLocations", {}))
+if focusName and focus_loc:
+    nearby = nearbyLocations(focus_loc, focusName, st.session_state.get("namedLocations", {}))
     if nearby:
         chips = " · ".join(f"{n} ({int(round(d))}m)" for n, d in nearby)
         st.caption(f"🧭 Near **{focusName}**: {chips}")
